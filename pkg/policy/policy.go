@@ -547,13 +547,12 @@ func pathWithinRoot(cleanedTarget, root, workDir string) bool {
 	if err1 != nil || err2 != nil {
 		return false
 	}
-	// Resolve symlinks when paths exist to prevent symlink escape attacks.
-	if realRoot, err := filepath.EvalSymlinks(absRoot); err == nil {
-		absRoot = realRoot
-	}
-	if realTarget, err := filepath.EvalSymlinks(absTarget); err == nil {
-		absTarget = realTarget
-	}
+	// Resolve symlinks and Windows 8.3 short names across existing ancestors so both
+	// macOS (/var -> /private/var) and Windows (RUNNER~1 -> runneradmin) match consistently
+	// even when the target leaf file does not yet exist on disk.
+	absRoot = resolveExistingAncestors(absRoot)
+	absTarget = resolveExistingAncestors(absTarget)
+
 	rel, err := filepath.Rel(absRoot, absTarget)
 	if err != nil {
 		return false
@@ -562,6 +561,33 @@ func pathWithinRoot(cleanedTarget, root, workDir string) bool {
 		return true
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveExistingAncestors resolves symlinks (and Windows 8.3 short names) for path p,
+// walking up to the deepest existing ancestor when the leaf does not yet exist.
+func resolveExistingAncestors(p string) string {
+	clean := filepath.Clean(p)
+	if real, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(real)
+	}
+	var tail []string
+	cur := clean
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return clean
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			parts := make([]string, 0, len(tail)+1)
+			parts = append(parts, real)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			return filepath.Clean(filepath.Join(parts...))
+		}
+	}
 }
 
 func domainMatch(pattern, host string) bool {

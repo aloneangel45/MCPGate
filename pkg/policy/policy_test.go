@@ -54,6 +54,10 @@ func TestEvaluatePathSecurityAndTraversal(t *testing.T) {
 	if d := p.EvaluatePath(filepath.Join(dir, "..", "outside.txt"), dir); d.Action != ActionDeny {
 		t.Fatalf("expected parent traversal denied, got %+v", d)
 	}
+	// Non-existent nested leaf inside allowlisted root must resolve existing ancestors cleanly.
+	if d := p.EvaluatePath(filepath.Join(dir, "nested", "new_dir", "future.go"), dir); d.Action != ActionAllow {
+		t.Fatalf("expected non-existent nested file within allowlisted root allowed, got %+v", d)
+	}
 }
 
 func TestEvaluateDomainRules(t *testing.T) {
