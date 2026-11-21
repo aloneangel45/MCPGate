@@ -385,10 +385,14 @@ func (p *Policy) EvaluatePath(rawPath, workDir string) Decision {
 	return Decision{Action: ActionAllow, RuleID: "MCP05-PATH-OK", Severity: SeverityInfo, Reason: "path allowed"}
 }
 
+func hasWindowsDrivePrefix(s string) bool {
+	return len(s) >= 2 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) && s[1] == ':'
+}
+
 func (p *Policy) evaluateSinglePathForm(origCandidate, form, workDir string) Decision {
 	normRaw := strings.ToLower(strings.ReplaceAll(form, "\\", "/"))
 	expanded := expandTilde(form)
-	isRooted := filepath.IsAbs(expanded) || strings.HasPrefix(expanded, "/") || strings.HasPrefix(expanded, `\`)
+	isRooted := filepath.IsAbs(expanded) || strings.HasPrefix(expanded, "/") || strings.HasPrefix(expanded, `\`) || hasWindowsDrivePrefix(expanded)
 	if !isRooted && workDir != "" {
 		expanded = filepath.Join(workDir, expanded)
 	}
