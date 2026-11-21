@@ -283,3 +283,71 @@ func envSliceToMap(env []string) map[string]string {
 	}
 	return m
 }
+
+func TestGenerateSeatbeltProfileInjectionHardening(t *testing.T) {
+	// 1. Quotes, backslashes, and parentheses in workDir must be safely escaped inside SBPL string.
+	weirdDir := `/tmp/proj "alpha" (1)\sub`
+	prof := GenerateSeatbeltProfile(weirdDir, true)
+	if !strings.Contains(prof, `(allow file-write* (subpath "`) {
+		t.Fatalf("expected allow file-write* rule for escaped weirdDir:\n%s", prof)
+	}
+	if strings.Contains(prof, `proj "alpha"`) {
+		t.Fatalf("unescaped quote leaked into Seatbelt profile:\n%s", prof)
+	}
+
+	// 2. Raw newline / NUL injection attempts must fail closed (never inject S-expressions!).
+	for _, evilDir := range []string{
+		"/tmp/safe\"))\n(allow file-read*)\n(\"",
+		"/tmp/safe\r\n(allow default)",
+		"/tmp/safe\x00evil",
+	} {
+		evilProf := GenerateSeatbeltProfile(evilDir, true)
+		if !strings.Contains(evilProf, "(deny file-write*)") {
+			t.Fatalf("expected (deny file-write*) to remain active:\n%s", evilProf)
+		}
+		if strings.Contains(evilProf, "(allow file-read*)") || strings.Contains(evilProf, "evil") {
+			t.Fatalf("Seatbelt profile injection succeeded for %q:\n%s", evilDir, evilProf)
+		}
+	}
+}
+
+func TestBuildCleanEnvWindowsCaseInsensitiveDeterministicDedup(t *testing.T) {
+	cfg := policy.SandboxPolicy{
+		CleanEnv: true,
+		PassEnv:  []string{"PATH", "path", "TEMP"},
+	}
+	baseEnv := []string{
+		"Path=C:\\Windows",
+		"TEMP=C:\\Temp",
+		"SECRET_TOKEN=must_be_stripped",
+	}
+	extra := map[string]string{
+		"HTTP_PROXY":  "http://127.0.0.1:9999",
+		"http_proxy":  "http://127.0.0.1:9999",
+		"HTTPS_PROXY": "http://127.0.0.1:9999",
+		"https_proxy": "http://127.0.0.1:9999",
+		"NO_PROXY":    "",
+		"no_proxy":    "",
+	}
+
+	// Run multiple iterations to prove 100% deterministic uppercase deduplication on Windows.
+	for iter := 0; iter < 20; iter++ {
+		got := buildCleanEnvForOS(cfg, baseEnv, extra, true)
+		seenUpper := make(map[string]int)
+		envMap := envSliceToMap(got)
+		for k := range envMap {
+			seenUpper[strings.ToUpper(k)]++
+		}
+		for uk, cnt := range seenUpper {
+			if cnt != 1 {
+				t.Fatalf("duplicate case-insensitive env key %s (%d times) in %v", uk, cnt, got)
+			}
+		}
+		if envMap["HTTP_PROXY"] != "http://127.0.0.1:9999" || envMap["HTTPS_PROXY"] != "http://127.0.0.1:9999" {
+			t.Fatalf("expected deterministic canonical uppercase HTTP_PROXY/HTTPS_PROXY, got %v", got)
+		}
+		if _, ok := envMap["NO_PROXY"]; !ok {
+			t.Fatalf("expected canonical uppercase NO_PROXY, got %v", got)
+		}
+	}
+}

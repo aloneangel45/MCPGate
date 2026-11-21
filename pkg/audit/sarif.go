@@ -3,6 +3,7 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,7 +17,7 @@ const (
 	// SARIFVersion is the OASIS SARIF specification version emitted by MCPGate.
 	SARIFVersion = "2.1.0"
 	// MCPGateVersion is the tool version stamped into SARIF tool metadata.
-	MCPGateVersion = "1.0.0"
+	MCPGateVersion = "1.0.1"
 	// MCPGateInfoURI is the project homepage URI stamped into SARIF tool metadata.
 	MCPGateInfoURI = "https://github.com/aloneangel45/mcpgate"
 )
@@ -337,9 +338,58 @@ func normalizeArtifactURI(rawPath string) string {
 	if p == "" {
 		return ""
 	}
+	lower := strings.ToLower(p)
+	// Preserve already-formed HTTP/HTTPS/file URIs cleanly.
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "file://") {
+		if u, err := url.Parse(p); err == nil {
+			return u.String()
+		}
+		return p
+	}
+
 	p = filepath.ToSlash(p)
 	p = strings.ReplaceAll(p, "\\", "/")
-	return p
+
+	// Windows UNC path: //server/share/path -> file://server/share/path
+	if strings.HasPrefix(p, "//") {
+		rest := strings.TrimPrefix(p, "//")
+		parts := strings.Split(rest, "/")
+		if len(parts) > 0 && parts[0] != "" {
+			host := parts[0]
+			encoded := encodeURIPathSegments(parts[1:])
+			if encoded != "" {
+				return "file://" + host + "/" + encoded
+			}
+			return "file://" + host
+		}
+	}
+
+	// Windows drive letter path: C:/Users/My Dir/mcp.json -> file:///C:/Users/My%20Dir/mcp.json
+	if len(p) >= 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' {
+		drive := strings.ToUpper(p[:1]) + ":"
+		rest := strings.TrimPrefix(p[2:], "/")
+		if rest == "" {
+			return "file:///" + drive + "/"
+		}
+		return "file:///" + drive + "/" + encodeURIPathSegments(strings.Split(rest, "/"))
+	}
+
+	// POSIX absolute path: /Users/Alice/Application Support/mcp.json -> file:///Users/...
+	if strings.HasPrefix(p, "/") {
+		rest := strings.TrimPrefix(p, "/")
+		return "file:///" + encodeURIPathSegments(strings.Split(rest, "/"))
+	}
+
+	// Relative path: keep relative URI reference with RFC 3986 percent-encoded segments.
+	return encodeURIPathSegments(strings.Split(p, "/"))
+}
+
+func encodeURIPathSegments(segments []string) string {
+	out := make([]string, len(segments))
+	for i, seg := range segments {
+		out[i] = url.PathEscape(seg)
+	}
+	return strings.Join(out, "/")
 }
 
 func eventLocationURI(ev policy.SecurityEvent) string {

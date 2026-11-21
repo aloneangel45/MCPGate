@@ -498,3 +498,80 @@ func TestSelfMCPServerBothFramings(t *testing.T) {
 		t.Fatalf("failed to parse Content-Length response: err=%v mode=%v payload=%s", err, mode, string(payload))
 	}
 }
+
+func TestAuditDirectorySkipsOversizedAndSymlinkLoops(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Valid small MCP config.
+	validPath := filepath.Join(dir, "mcp.json")
+	if err := os.WriteFile(validPath, []byte(`{"mcpServers":{"fs":{"command":"npx","args":["@modelcontextprotocol/server-filesystem","/"]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Oversized > 2 MiB file named mcp_huge.json (must be skipped cleanly without OOM or error).
+	hugePath := filepath.Join(dir, "mcp_huge.json")
+	if err := os.WriteFile(hugePath, make([]byte, maxAuditJSONCandidateBytes+1024), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Best-effort symlink loop (may require privilege on some Windows hosts, so skip creation error gracefully).
+	_ = os.Symlink(dir, filepath.Join(dir, "loop_dir"))
+	_ = os.Symlink(filepath.Join(dir, "mcp_dangling.json"), filepath.Join(dir, "mcp_dangling.json"))
+
+	targets, err := collectAuditTargets([]string{dir}, false)
+	if err != nil {
+		t.Fatalf("collectAuditTargets failed: %v", err)
+	}
+	if len(targets) != 1 || filepath.Clean(targets[0]) != filepath.Clean(validPath) {
+		t.Fatalf("expected only %q collected (oversized & symlink loops skipped), got %v", validPath, targets)
+	}
+}
+
+func TestSelfMCPBatchErrorHandlingAndMIMEHeaders(t *testing.T) {
+	// 1. Empty batch -> -32600 Invalid Request; valid batch -> array of responses; missing method -> -32600; missing tool name -> -32602.
+	requests := []string{
+		`[]`,
+		`[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]`,
+		`{"jsonrpc":"2.0","id":3}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":""}}`,
+		`{"jsonrpc":"1.0","id":5,"method":"ping"}`,
+	}
+	code, out, errOut := execCLI([]string{"mcp"}, strings.Join(requests, "\n")+"\n")
+	if code != 0 {
+		t.Fatalf("mcpgate mcp failed: code=%d err=%s", code, errOut)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("expected 5 response lines, got %d:\n%s", len(lines), out)
+	}
+	if !strings.Contains(lines[0], `-32600`) {
+		t.Fatalf("expected -32600 for empty batch, got %s", lines[0])
+	}
+	var batchResp []map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &batchResp); err != nil || len(batchResp) != 2 {
+		t.Fatalf("expected 2-element batch response, got err=%v line=%s", err, lines[1])
+	}
+	if !strings.Contains(lines[2], `-32600`) {
+		t.Fatalf("expected -32600 for missing method, got %s", lines[2])
+	}
+	if !strings.Contains(lines[3], `-32602`) {
+		t.Fatalf("expected -32602 for missing tool name, got %s", lines[3])
+	}
+	if !strings.Contains(lines[4], `-32600`) {
+		t.Fatalf("expected -32600 for unsupported jsonrpc version, got %s", lines[4])
+	}
+
+	// 2. Non-canonical MIME headers before lowercase content-length.
+	msg := `{"jsonrpc":"2.0","id":99,"method":"ping"}`
+	framed := fmt.Sprintf("X-Client: test\r\nContent-Type: application/json\r\ncontent-length: %d\r\n\r\n%s", len(msg), msg)
+	code, clOut, errOut := execCLI([]string{"mcp"}, framed)
+	if code != 0 || !strings.Contains(clOut, `"id":99`) {
+		t.Fatalf("non-canonical MIME headers failed: code=%d out=%q err=%q", code, clOut, errOut)
+	}
+
+	// 3. Conflicting duplicate Content-Length headers rejected cleanly.
+	smuggled := "Content-Length: 5\r\nContent-Length: 40\r\n\r\n" + msg
+	if _, _, err := readJSONRPCFrame(bufio.NewReader(strings.NewReader(smuggled))); err == nil {
+		t.Fatalf("expected error on conflicting duplicate Content-Length headers")
+	}
+}

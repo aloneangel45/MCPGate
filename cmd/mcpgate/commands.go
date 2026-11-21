@@ -545,7 +545,17 @@ func collectAuditTargets(args []string, allIDEs bool) ([]string, error) {
 
 		err = filepath.WalkDir(arg, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
-				return walkErr
+				// Skip unreadable entries (e.g. broken symlinks or permission-denied subdirs)
+				// instead of aborting the entire directory audit.
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			// Never follow symlinks during recursive directory walks (prevents symlink loops
+			// and dangling symlink failures).
+			if d.Type()&fs.ModeSymlink != 0 {
+				return nil
 			}
 			if d.IsDir() {
 				name := d.Name()
@@ -554,7 +564,11 @@ func collectAuditTargets(args []string, allIDEs bool) ([]string, error) {
 				}
 				return nil
 			}
-			if isCandidateAuditFile(path) {
+			info, infoErr := d.Info()
+			if infoErr != nil || !info.Mode().IsRegular() {
+				return nil
+			}
+			if isCandidateAuditFile(path, info.Size()) {
 				add(path)
 			}
 			return nil
@@ -566,32 +580,59 @@ func collectAuditTargets(args []string, allIDEs bool) ([]string, error) {
 	return out, nil
 }
 
-func isCandidateAuditFile(path string) bool {
+const (
+	maxAuditJSONCandidateBytes int64 = 2 * 1024 * 1024
+	maxAuditYAMLCandidateBytes int64 = 512 * 1024
+)
+
+func isCandidateAuditFile(path string, fileSize int64) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	base := strings.ToLower(filepath.Base(path))
 	switch ext {
 	case ".json", ".jsonc":
+		if fileSize < 0 || fileSize > maxAuditJSONCandidateBytes {
+			return false
+		}
 		if strings.Contains(base, "mcp") || strings.Contains(base, "claude") {
 			return true
 		}
-		data, err := os.ReadFile(path)
-		if err != nil || len(data) > 2*1024*1024 {
+		data, err := readFilePrefix(path, maxAuditJSONCandidateBytes)
+		if err != nil {
 			return false
 		}
 		s := string(data)
 		return strings.Contains(s, `"mcpServers"`) || strings.Contains(s, `"servers"`) || strings.Contains(s, `"context_servers"`)
 	case ".yaml", ".yml":
+		if fileSize < 0 || fileSize > maxAuditYAMLCandidateBytes {
+			return false
+		}
 		if strings.Contains(base, "mcpgate") {
 			return true
 		}
-		data, err := os.ReadFile(path)
-		if err != nil || len(data) > 512*1024 {
+		data, err := readFilePrefix(path, maxAuditYAMLCandidateBytes)
+		if err != nil {
 			return false
 		}
 		return strings.Contains(string(data), policy.CurrentVersion)
 	default:
 		return false
 	}
+}
+
+func readFilePrefix(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file %q exceeds %d byte limit", path, maxBytes)
+	}
+	return data, nil
 }
 
 func formatAuditTable(r *audit.AuditReport) string {

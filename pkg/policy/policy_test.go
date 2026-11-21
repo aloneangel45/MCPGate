@@ -109,3 +109,52 @@ mcp:
 	}
 }
 
+func TestEvaluatePathURLEncodedAndFileURIBypasses(t *testing.T) {
+	dir := t.TempDir()
+	p, _ := Preset("strict")
+	p.Filesystem.AllowPaths = []string{dir}
+
+	blockedCases := []struct {
+		name string
+		raw  string
+	}{
+		{"url-encoded traversal etc/passwd", "%2e%2e%2f%2e%2e%2fetc%2fpasswd"},
+		{"url-encoded ssh key", "..%2f..%2f.ssh%2fid_rsa"},
+		{"double-encoded dotenv", "%252e%252e%252f.env"},
+		{"stray percent evasion", "%2e%2e%2foutside.txt%zz"},
+		{"file URI /etc/passwd", "file:///etc/passwd"},
+		{"file URI uppercase localhost", "file://LOCALHOST/etc/shadow"},
+		{"file URI Windows drive escape", "file://localhost/C:/Windows/win.ini"},
+		{"file URI percent-encoded drive & ssh", "file:///C%3A/Users/victim/.ssh/id_rsa"},
+		{"raw NUL byte", "safe.txt\x00.png"},
+		{"percent-encoded NUL byte", "safe.txt%00.png"},
+		{"rooted POSIX path outside allowlist", "/tmp/outside-allowlist.txt"},
+	}
+
+	for _, tc := range blockedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := p.EvaluatePath(tc.raw, dir)
+			if d.Action != ActionDeny {
+				t.Fatalf("EvaluatePath(%q) = %+v, want ActionDeny", tc.raw, d)
+			}
+		})
+	}
+}
+
+func TestEvaluateDomainTrailingDotAndPortNormalization(t *testing.T) {
+	p, _ := Preset("strict")
+	p.Network.AllowDomains = []string{"*.openai.com"}
+	p.Network.DenyDomains = []string{"evil.openai.com"}
+
+	// Trailing dot before :port must NOT bypass DenyDomains!
+	if d := p.EvaluateDomain("EVIL.OPENAI.COM.:443", 443); d.Action != ActionDeny || d.RuleID != "MCP06-EGRESS-DENY" {
+		t.Fatalf("expected MCP06-EGRESS-DENY for EVIL.OPENAI.COM.:443, got %+v", d)
+	}
+	if d := p.EvaluateDomain("evil.openai.com..", 443); d.Action != ActionDeny || d.RuleID != "MCP06-EGRESS-DENY" {
+		t.Fatalf("expected MCP06-EGRESS-DENY for evil.openai.com.., got %+v", d)
+	}
+	if d := p.EvaluateDomain("API.OPENAI.COM.:443", 443); d.Action != ActionAllow {
+		t.Fatalf("expected API.OPENAI.COM.:443 allowed, got %+v", d)
+	}
+}
+

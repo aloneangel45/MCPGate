@@ -56,13 +56,16 @@ type Options struct {
 // Proxy is a local HTTP and HTTPS CONNECT egress firewall enforcing domain policy,
 // SSRF/DNS-rebinding protection, and live DLP inspection.
 type Proxy struct {
-	opts      Options
-	listener  net.Listener
-	server    *http.Server
-	ca        *EphemeralCA
-	transport *http.Transport
+	opts       Options
+	listener   net.Listener
+	server     *http.Server
+	ca         *EphemeralCA
+	transport  *http.Transport
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
 
 	connsMu     sync.Mutex
+	closed      bool
 	activeConns map[net.Conn]struct{}
 
 	closeOnce sync.Once
@@ -102,10 +105,14 @@ func New(opts Options) (*Proxy, error) {
 		return nil, fmt.Errorf("listen on %s: %w", opts.ListenAddr, err)
 	}
 
+	baseCtx, baseCancel := context.WithCancel(context.Background())
+
 	p := &Proxy{
 		opts:        opts,
 		listener:    ln,
 		ca:          ca,
+		baseCtx:     baseCtx,
+		baseCancel:  baseCancel,
 		activeConns: make(map[net.Conn]struct{}),
 	}
 
@@ -124,6 +131,11 @@ func New(opts Options) (*Proxy, error) {
 	p.server = &http.Server{
 		Handler:           http.HandlerFunc(p.serveHTTP),
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
+		BaseContext: func(net.Listener) context.Context {
+			return p.baseCtx
+		},
 	}
 
 	go func() {
@@ -195,6 +207,20 @@ func (p *Proxy) Close() error {
 	p.closeOnce.Do(func() {
 		var errs []error
 
+		// Cancel in-flight dials and upstream round-trips first so shutdown completes promptly.
+		if p.baseCancel != nil {
+			p.baseCancel()
+		}
+
+		// Mark closed and force-close any hijacked CONNECT tunnel connections.
+		p.connsMu.Lock()
+		p.closed = true
+		for c := range p.activeConns {
+			_ = c.Close()
+		}
+		p.activeConns = make(map[net.Conn]struct{})
+		p.connsMu.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if p.server != nil {
@@ -202,14 +228,6 @@ func (p *Proxy) Close() error {
 				_ = p.server.Close()
 			}
 		}
-
-		// Force-close any hijacked CONNECT tunnel connections.
-		p.connsMu.Lock()
-		for c := range p.activeConns {
-			_ = c.Close()
-		}
-		p.activeConns = make(map[net.Conn]struct{})
-		p.connsMu.Unlock()
 
 		if p.transport != nil {
 			p.transport.CloseIdleConnections()
@@ -228,10 +246,16 @@ func (p *Proxy) Close() error {
 	return p.closeErr
 }
 
-func (p *Proxy) trackConn(c net.Conn) {
+func (p *Proxy) trackConn(c net.Conn) bool {
 	p.connsMu.Lock()
+	if p.closed {
+		p.connsMu.Unlock()
+		_ = c.Close()
+		return false
+	}
 	p.activeConns[c] = struct{}{}
 	p.connsMu.Unlock()
+	return true
 }
 
 func (p *Proxy) untrackConn(c net.Conn) {
@@ -274,6 +298,13 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if scheme == "" {
 		scheme = "http"
 	}
+	if scheme != "http" && scheme != "https" {
+		writeJSONError(w, http.StatusBadRequest, map[string]any{
+			"error":  "unsupported proxy URL scheme",
+			"reason": fmt.Sprintf("unsupported scheme %q (expected http or https)", scheme),
+		})
+		return
+	}
 	if scheme == "https" {
 		defaultPort = 443
 	}
@@ -285,6 +316,49 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			"reason": err.Error(),
 		})
 		return
+	}
+
+	// Guard against Host-header domain fronting when r.Host differs from r.URL.Host.
+	if r.Host != "" && r.URL.Host != "" {
+		hdrHost, hdrPort, _, hdrErr := parseHostPort(r.Host, port)
+		if hdrErr == nil && hdrHost != host {
+			if decHdr := p.opts.Policy.EvaluateDomain(hdrHost, hdrPort); decHdr.Action != policy.ActionAllow {
+				p.emitEvent(policy.SecurityEvent{
+					Category: "egress",
+					Severity: decHdr.Severity,
+					Action:   "blocked",
+					RuleID:   decHdr.RuleID,
+					Target:   hdrHost,
+					Message:  fmt.Sprintf("Host header %q mismatch blocked: %s", r.Host, decHdr.Reason),
+					Metadata: map[string]string{"method": r.Method, "scheme": scheme, "url_host": hostPort},
+				})
+				writeJSONError(w, http.StatusForbidden, map[string]any{
+					"error":   "blocked by MCPGate egress policy",
+					"rule_id": decHdr.RuleID,
+					"reason":  decHdr.Reason,
+					"target":  hdrHost,
+				})
+				return
+			}
+			if blocked, ruleID, reason := ValidateTargetHost(hdrHost, p.opts.Policy.Network); blocked {
+				p.emitEvent(policy.SecurityEvent{
+					Category: "ssrf",
+					Severity: severityForSSRFRule(ruleID),
+					Action:   "blocked",
+					RuleID:   ruleID,
+					Target:   hdrHost,
+					Message:  reason,
+					Metadata: map[string]string{"method": r.Method, "scheme": scheme, "url_host": hostPort},
+				})
+				writeJSONError(w, http.StatusForbidden, map[string]any{
+					"error":   "blocked by MCPGate SSRF guard",
+					"rule_id": ruleID,
+					"reason":  reason,
+					"target":  hdrHost,
+				})
+				return
+			}
+		}
 	}
 
 	// 1. Domain / port / airgapped policy check.
@@ -517,8 +591,15 @@ func (p *Proxy) handleConnectTunnel(w http.ResponseWriter, r *http.Request, host
 		return
 	}
 
-	p.trackConn(rawClientConn)
-	p.trackConn(upstreamConn)
+	if !p.trackConn(rawClientConn) {
+		_ = upstreamConn.Close()
+		return
+	}
+	if !p.trackConn(upstreamConn) {
+		p.untrackConn(rawClientConn)
+		_ = rawClientConn.Close()
+		return
+	}
 	defer func() {
 		p.untrackConn(rawClientConn)
 		p.untrackConn(upstreamConn)
@@ -583,7 +664,9 @@ func (p *Proxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, host s
 		return
 	}
 
-	p.trackConn(rawClientConn)
+	if !p.trackConn(rawClientConn) {
+		return
+	}
 	defer func() {
 		p.untrackConn(rawClientConn)
 		_ = rawClientConn.Close()
@@ -605,20 +688,63 @@ func (p *Proxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, host s
 
 	reader := bufio.NewReader(tlsClient)
 	for {
+		_ = tlsClient.SetReadDeadline(time.Now().Add(60 * time.Second))
 		req, err := http.ReadRequest(reader)
 		if err != nil {
 			return
 		}
+		_ = tlsClient.SetReadDeadline(time.Time{})
 
 		reqHost := req.Host
 		if reqHost == "" {
 			reqHost = hostPort
+		} else if hdrHost, hdrPort, _, hdrErr := parseHostPort(reqHost, port); hdrErr == nil && hdrHost != host {
+			// Guard against TLS MITM domain fronting via mismatched inner Host header.
+			if decHdr := p.opts.Policy.EvaluateDomain(hdrHost, hdrPort); decHdr.Action != policy.ActionAllow {
+				_ = req.Body.Close()
+				p.emitEvent(policy.SecurityEvent{
+					Category: "egress",
+					Severity: decHdr.Severity,
+					Action:   "blocked",
+					RuleID:   decHdr.RuleID,
+					Target:   hdrHost,
+					Message:  fmt.Sprintf("inner HTTPS Host header %q blocked: %s", reqHost, decHdr.Reason),
+					Metadata: map[string]string{"method": req.Method, "connect_target": hostPort},
+				})
+				_ = writeRawJSONResponse(tlsClient, http.StatusForbidden, map[string]any{
+					"error":   "blocked by MCPGate egress policy",
+					"rule_id": decHdr.RuleID,
+					"reason":  decHdr.Reason,
+					"target":  hdrHost,
+				})
+				return
+			}
+			if blocked, ruleID, reason := ValidateTargetHost(hdrHost, p.opts.Policy.Network); blocked {
+				_ = req.Body.Close()
+				p.emitEvent(policy.SecurityEvent{
+					Category: "ssrf",
+					Severity: severityForSSRFRule(ruleID),
+					Action:   "blocked",
+					RuleID:   ruleID,
+					Target:   hdrHost,
+					Message:  reason,
+					Metadata: map[string]string{"method": req.Method, "connect_target": hostPort},
+				})
+				_ = writeRawJSONResponse(tlsClient, http.StatusForbidden, map[string]any{
+					"error":   "blocked by MCPGate SSRF guard",
+					"rule_id": ruleID,
+					"reason":  reason,
+					"target":  hdrHost,
+				})
+				return
+			}
 		}
+
 		outURL := *req.URL
 		outURL.Scheme = "https"
 		outURL.Host = hostPort
 
-		outCtx := context.WithValue(context.Background(), pinnedTargetKey{}, pinnedTarget{
+		outCtx := context.WithValue(p.baseCtx, pinnedTargetKey{}, pinnedTarget{
 			ip:   pinnedIP,
 			host: host,
 			port: port,

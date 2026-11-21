@@ -2,10 +2,12 @@ package mcpproxy
 
 import (
 	"fmt"
+	"html"
 	"regexp"
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/mcpgate/pkg/policy"
 )
@@ -43,7 +45,7 @@ var (
 			category:    "prompt_injection",
 			severity:    policy.SeverityCritical,
 			description: "embedded XML/tag prompt-injection directive",
-			re:          regexp.MustCompile(`(?i)<\s*/?\s*(?:IMPORTANT|SYSTEM|INSTRUCTIONS?|HIDDEN|SECRET|OVERRIDE)\s*>`),
+			re:          regexp.MustCompile(`(?i)<\s*/?\s*(?:IMPORTANT|SYSTEM|INSTRUCTIONS?|HIDDEN|SECRET|OVERRIDE)(?:\s+[^>]*)?\s*/?\s*>`),
 		},
 		{
 			ruleID:      "MCP01-TOOL-POISONING",
@@ -185,51 +187,60 @@ func scanSchemaValue(path string, v any, out *[]PoisonFinding) {
 	}
 }
 
-// ScanTextPoisoning scans a single text field for poisoning indicators.
+// ScanTextPoisoning scans a single text field for poisoning indicators, including
+// HTML-entity obfuscated tags and invisible Unicode character smuggling.
 func ScanTextPoisoning(field, text string) []PoisonFinding {
 	if text == "" {
 		return nil
 	}
 	var findings []PoisonFinding
 
-	for _, pat := range promptInjectionPatterns {
-		if m := pat.re.FindString(text); m != "" {
-			findings = append(findings, PoisonFinding{
-				RuleID:      pat.ruleID,
-				Category:    pat.category,
-				Severity:    pat.severity,
-				Field:       field,
-				Evidence:    truncateEvidence(strings.TrimSpace(m), 96),
-				Description: pat.description,
-			})
+	// Build normalized text variants: raw, HTML-entity decoded (up to 2 passes),
+	// and invisible-Unicode-stripped so obfuscation cannot hide tags or keywords.
+	variants := []string{text}
+	unescaped := text
+	for pass := 0; pass < 2; pass++ {
+		next := html.UnescapeString(unescaped)
+		if next == unescaped {
+			break
+		}
+		unescaped = next
+	}
+	if unescaped != text {
+		variants = append(variants, unescaped)
+	}
+	stripped := stripSuspiciousUnicode(unescaped)
+	if stripped != unescaped && stripped != text {
+		variants = append(variants, stripped)
+	}
+
+	seen := make(map[string]struct{})
+	checkPatterns := func(patterns []poisonPattern) {
+		for _, pat := range patterns {
+			key := pat.category + "|" + pat.description
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			for _, candidate := range variants {
+				if m := pat.re.FindString(candidate); m != "" {
+					seen[key] = struct{}{}
+					findings = append(findings, PoisonFinding{
+						RuleID:      pat.ruleID,
+						Category:    pat.category,
+						Severity:    pat.severity,
+						Field:       field,
+						Evidence:    truncateEvidence(strings.TrimSpace(m), 96),
+						Description: pat.description,
+					})
+					break
+				}
+			}
 		}
 	}
 
-	for _, pat := range exfilPatterns {
-		if m := pat.re.FindString(text); m != "" {
-			findings = append(findings, PoisonFinding{
-				RuleID:      pat.ruleID,
-				Category:    pat.category,
-				Severity:    pat.severity,
-				Field:       field,
-				Evidence:    truncateEvidence(strings.TrimSpace(m), 96),
-				Description: pat.description,
-			})
-		}
-	}
-
-	for _, pat := range shellSmugglingPatterns {
-		if m := pat.re.FindString(text); m != "" {
-			findings = append(findings, PoisonFinding{
-				RuleID:      pat.ruleID,
-				Category:    pat.category,
-				Severity:    pat.severity,
-				Field:       field,
-				Evidence:    truncateEvidence(strings.TrimSpace(m), 96),
-				Description: pat.description,
-			})
-		}
-	}
+	checkPatterns(promptInjectionPatterns)
+	checkPatterns(exfilPatterns)
+	checkPatterns(shellSmugglingPatterns)
 
 	if codepoints := findSuspiciousUnicode(text); len(codepoints) > 0 {
 		findings = append(findings, PoisonFinding{
@@ -256,6 +267,27 @@ func ScanTextPoisoning(field, text string) []PoisonFinding {
 	return findings
 }
 
+func stripSuspiciousUnicode(s string) string {
+	hasAny := false
+	for _, r := range s {
+		if isSuspiciousUnicodeRune(r) {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if !isSuspiciousUnicodeRune(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func findSuspiciousUnicode(s string) []string {
 	seen := make(map[rune]struct{})
 	var found []string
@@ -275,11 +307,19 @@ func findSuspiciousUnicode(s string) []string {
 
 func isSuspiciousUnicodeRune(r rune) bool {
 	switch {
+	case r == 0x00AD: // Soft hyphen (invisible word splitter)
+		return true
+	case r == 0x061C: // Arabic Letter Mark (BiDi control)
+		return true
 	case r >= 0x200B && r <= 0x200F: // Zero-width & directional marks
 		return true
 	case r >= 0x202A && r <= 0x202E: // BiDi embedding & override
 		return true
+	case r == 0x2060: // Word Joiner (invisible)
+		return true
 	case r >= 0x2066 && r <= 0x2069: // BiDi isolates
+		return true
+	case r == 0xFEFF: // Zero-Width No-Break Space / embedded BOM
 		return true
 	case r >= 0xE0000 && r <= 0xE007F: // Unicode Tag characters (invisible prompt smuggling)
 		return true
@@ -341,11 +381,16 @@ func looksLikeBase64Payload(tok string) bool {
 }
 
 func truncateEvidence(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if utf8.RuneCountInString(s) <= maxLen {
 		return s
 	}
 	if maxLen <= 3 {
-		return s[:maxLen]
+		runes := []rune(s)
+		if maxLen < 0 {
+			return ""
+		}
+		return string(runes[:maxLen])
 	}
-	return s[:maxLen-3] + "..."
+	runes := []rune(s)
+	return string(runes[:maxLen-3]) + "..."
 }

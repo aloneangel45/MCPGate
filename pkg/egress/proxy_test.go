@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -723,4 +724,99 @@ func assertForbiddenRule(t *testing.T, resp *http.Response, wantRuleID string) {
 	if payload["rule_id"] != wantRuleID {
 		t.Fatalf("rule_id = %v, want %q; body=%s", payload["rule_id"], wantRuleID, string(body))
 	}
+}
+
+func TestSSRFIPv6TransitionZoneAndTrailingDotHardening(t *testing.T) {
+	cfg := policy.NetworkPolicy{
+		Enabled:            true,
+		BlockPrivateIPs:    true,
+		BlockCloudMetadata: true,
+	}
+
+	embeddedCases := []struct {
+		ip         string
+		wantRuleID string
+	}{
+		{"::ffff:169.254.169.254", "MCP04-SSRF-METADATA"},
+		{"::ffff:127.0.0.1", "MCP04-SSRF-PRIVATE-IP"},
+		{"64:ff9b::169.254.169.254", "MCP04-SSRF-METADATA"},
+		{"::ffff:0:169.254.169.254", "MCP04-SSRF-METADATA"},
+		{"::169.254.169.254", "MCP04-SSRF-METADATA"},
+		{"2002:a9fe:a9fe::1", "MCP04-SSRF-METADATA"},
+		{"2002:7f00:0001::1", "MCP04-SSRF-PRIVATE-IP"},
+	}
+
+	for _, tc := range embeddedCases {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", tc.ip)
+		}
+		blocked, ruleID, _ := ValidateTargetIP(ip, cfg)
+		if !blocked || ruleID != tc.wantRuleID {
+			t.Errorf("ValidateTargetIP(%s) = (%v, %q), want (true, %q)", tc.ip, blocked, ruleID, tc.wantRuleID)
+		}
+	}
+
+	// Multiple trailing dots and uppercase on cloud metadata hostname.
+	if blocked, ruleID, _ := ValidateTargetHost("METADATA.GOOGLE.INTERNAL..", cfg); !blocked || ruleID != "MCP04-SSRF-METADATA" {
+		t.Fatalf("expected MCP04-SSRF-METADATA for METADATA.GOOGLE.INTERNAL.., got (%v, %q)", blocked, ruleID)
+	}
+
+	// IPv6 zone IDs (fe80::1%eth0, fe80::1%25eth0) must be parsed and blocked as private/link-local.
+	for _, zHost := range []string{"fe80::1%eth0", "fe80::1%25eth0", "[::1%lo0]:8080"} {
+		_, blockErr, resolveErr := resolveAndPinIP(context.Background(), nil, zHost, cfg, false)
+		if resolveErr != nil || blockErr == nil || blockErr.RuleID != "MCP04-SSRF-PRIVATE-IP" {
+			t.Fatalf("resolveAndPinIP(%q) = (block=%+v, err=%v), want MCP04-SSRF-PRIVATE-IP", zHost, blockErr, resolveErr)
+		}
+	}
+
+	// Live proxy checks for bracketed IPv6, IPv4-mapped IPv6, and Host-header domain fronting.
+	pol := &policy.Policy{
+		Version: policy.CurrentVersion,
+		Network: policy.NetworkPolicy{
+			Enabled:            true,
+			AllowDomains:       []string{"allowed.example"},
+			DenyDomains:        []string{"denied.example"},
+			AllowPorts:         []int{80, 443, 8080},
+			BlockPrivateIPs:    true,
+			BlockCloudMetadata: true,
+		},
+	}
+	proxy, err := New(Options{Policy: pol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	// Bracketed IPv6 loopback and IPv4-mapped metadata blocked on balanced proxy too.
+	balPol, _ := policy.Preset("balanced")
+	balPol.Network.AllowPorts = nil
+	balProxy, err := New(Options{Policy: balPol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer balProxy.Close()
+	balClient := newProxyHTTPClient(t, balProxy.ProxyURL(), nil)
+
+	resp, err := balClient.Get("http://[::1]:8080/internal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertForbiddenRule(t, resp, "MCP04-SSRF-PRIVATE-IP")
+
+	resp, err = balClient.Get("http://[::ffff:169.254.169.254]/latest/meta-data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertForbiddenRule(t, resp, "MCP04-SSRF-METADATA")
+
+	// Domain fronting via mismatched Host header must be blocked with 403 MCP06-EGRESS-DENY!
+	strictClient := newProxyHTTPClient(t, proxy.ProxyURL(), nil)
+	req, _ := http.NewRequest(http.MethodGet, "http://allowed.example/resource", nil)
+	req.Host = "denied.example"
+	resp, err = strictClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertForbiddenRule(t, resp, "MCP06-EGRESS-DENY")
 }

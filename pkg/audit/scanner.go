@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -16,6 +17,10 @@ import (
 	"github.com/aloneangel45/mcpgate/pkg/policy"
 	"github.com/aloneangel45/mcpgate/pkg/preset"
 )
+
+// MaxAuditFileBytes caps the maximum single config/policy file size read by AuditFiles
+// to protect against OOM on oversized files.
+const MaxAuditFileBytes int64 = 10 * 1024 * 1024 // 10 MiB
 
 // Finding represents a single OWASP MCP Top 10 static or configuration security issue.
 // Evidence and Message are always redacted and never contain raw secret values.
@@ -159,7 +164,7 @@ func AuditFiles(paths []string) (*AuditReport, error) {
 		if p == "" {
 			continue
 		}
-		data, err := os.ReadFile(p)
+		data, err := readBoundedAuditFile(p, MaxAuditFileBytes)
 		if err != nil {
 			return nil, fmt.Errorf("read audit target %q: %w", p, err)
 		}
@@ -204,6 +209,32 @@ func AuditPolicyBytes(sourceName string, data []byte) (*AuditReport, error) {
 	}
 	finalizeReport(report)
 	return report, nil
+}
+
+func readBoundedAuditFile(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file (mode=%s)", info.Mode())
+	}
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("file size %d exceeds %d byte audit limit", info.Size(), maxBytes)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file exceeds %d byte audit limit", maxBytes)
+	}
+	return data, nil
 }
 
 func newAuditReport() *AuditReport {

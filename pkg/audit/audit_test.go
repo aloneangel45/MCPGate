@@ -3,6 +3,7 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -563,5 +564,43 @@ func TestHTMLReportXSSProtectionAndZeroExternalURLs(t *testing.T) {
 				t.Errorf("%s missing interactive element %q", tc.name, marker)
 			}
 		}
+	}
+}
+
+func TestSARIFURIWindowsAndSpecialCharEscaping(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{`C:\Users\Alice Smith\.cursor\mcp #1.json`, `file:///C:/Users/Alice%20Smith/.cursor/mcp%20%231.json`},
+		{`\\fileserver\share\my config.json`, `file://fileserver/share/my%20config.json`},
+		{`/Users/Alice/Application Support/Claude/config.json`, `file:///Users/Alice/Application%20Support/Claude/config.json`},
+		{`configs/mcp 100%.json`, `configs/mcp%20100%25.json`},
+		{`mcpgate.yaml`, `mcpgate.yaml`},
+		{`http://169.254.169.254/latest/meta-data/`, `http://169.254.169.254/latest/meta-data/`},
+	}
+
+	for _, tc := range cases {
+		got := normalizeArtifactURI(tc.raw)
+		if got != tc.want {
+			t.Errorf("normalizeArtifactURI(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+		if _, err := url.Parse(got); err != nil {
+			t.Errorf("normalizeArtifactURI(%q) produced invalid RFC 3986 URI %q: %v", tc.raw, got, err)
+		}
+	}
+}
+
+func TestReadBoundedAuditFileRejectsOversized(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "big.json")
+	if err := os.WriteFile(p, make([]byte, 2048), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBoundedAuditFile(p, 1024); err == nil {
+		t.Fatalf("expected error when file exceeds maxBytes limit")
+	}
+	data, err := readBoundedAuditFile(p, 4096)
+	if err != nil || len(data) != 2048 {
+		t.Fatalf("expected bounded read within limit to succeed, got len=%d err=%v", len(data), err)
 	}
 }

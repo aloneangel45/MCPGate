@@ -360,9 +360,36 @@ func (p *Policy) EvaluatePath(rawPath, workDir string) Decision {
 		return Decision{Action: ActionAllow, RuleID: "MCP05-PATH-OK", Severity: SeverityInfo}
 	}
 
-	normRaw := strings.ToLower(strings.ReplaceAll(candidate, "\\", "/"))
-	expanded := expandTilde(candidate)
-	if !filepath.IsAbs(expanded) && workDir != "" {
+	decoded, hasNull := decodeCandidatePath(candidate)
+	if hasNull {
+		return Decision{
+			Action:   ActionDeny,
+			RuleID:   "MCP05-PATH-TRAVERSAL",
+			Severity: SeverityCritical,
+			Reason:   fmt.Sprintf("path %q contains illegal NUL byte", candidate),
+		}
+	}
+
+	// Build candidate forms (decoded canonical path plus raw if it differs).
+	forms := []string{decoded}
+	if decoded != candidate {
+		forms = append(forms, candidate)
+	}
+
+	for _, form := range forms {
+		if dec := p.evaluateSinglePathForm(candidate, form, workDir); dec.Action != ActionAllow {
+			return dec
+		}
+	}
+
+	return Decision{Action: ActionAllow, RuleID: "MCP05-PATH-OK", Severity: SeverityInfo, Reason: "path allowed"}
+}
+
+func (p *Policy) evaluateSinglePathForm(origCandidate, form, workDir string) Decision {
+	normRaw := strings.ToLower(strings.ReplaceAll(form, "\\", "/"))
+	expanded := expandTilde(form)
+	isRooted := filepath.IsAbs(expanded) || strings.HasPrefix(expanded, "/") || strings.HasPrefix(expanded, `\`)
+	if !isRooted && workDir != "" {
 		expanded = filepath.Join(workDir, expanded)
 	}
 	cleaned := filepath.Clean(expanded)
@@ -376,7 +403,7 @@ func (p *Policy) EvaluatePath(rawPath, workDir string) Decision {
 					Action:   ActionDeny,
 					RuleID:   "MCP05-SENSITIVE-PATH",
 					Severity: SeverityCritical,
-					Reason:   fmt.Sprintf("path %q targets protected sensitive credential location (%s)", candidate, seg),
+					Reason:   fmt.Sprintf("path %q targets protected sensitive credential location (%s)", origCandidate, seg),
 				}
 			}
 		}
@@ -384,12 +411,12 @@ func (p *Policy) EvaluatePath(rawPath, workDir string) Decision {
 
 	// 2. Explicit DenyPaths check.
 	for _, deny := range p.Filesystem.DenyPaths {
-		if pathMatchesRule(candidate, cleaned, deny, workDir) {
+		if pathMatchesRule(form, cleaned, deny, workDir) {
 			return Decision{
 				Action:   ActionDeny,
 				RuleID:   "MCP05-PATH-DENY",
 				Severity: SeverityHigh,
-				Reason:   fmt.Sprintf("path %q matches deny rule %q", candidate, deny),
+				Reason:   fmt.Sprintf("path %q matches deny rule %q", origCandidate, deny),
 			}
 		}
 	}
@@ -408,7 +435,7 @@ func (p *Policy) EvaluatePath(rawPath, workDir string) Decision {
 				Action:   ActionDeny,
 				RuleID:   "MCP05-PATH-TRAVERSAL",
 				Severity: SeverityHigh,
-				Reason:   fmt.Sprintf("path %q escapes allowlisted roots %v", candidate, p.Filesystem.AllowPaths),
+				Reason:   fmt.Sprintf("path %q escapes allowlisted roots %v", origCandidate, p.Filesystem.AllowPaths),
 			}
 		}
 	}
@@ -416,15 +443,99 @@ func (p *Policy) EvaluatePath(rawPath, workDir string) Decision {
 	return Decision{Action: ActionAllow, RuleID: "MCP05-PATH-OK", Severity: SeverityInfo, Reason: "path allowed"}
 }
 
+// decodeCandidatePath normalizes file:// URIs and iteratively percent-decodes valid %XX
+// sequences so URL-encoded traversals (%2e%2e%2f, %252e%252e%252f, file:///etc/passwd)
+// cannot evade path confinement or sensitive-file checks.
+func decodeCandidatePath(raw string) (string, bool) {
+	if strings.ContainsRune(raw, 0) {
+		return "", true
+	}
+	s := raw
+	for pass := 0; pass < 3; pass++ {
+		next := stripFileURIScheme(s)
+		next = percentDecodeLenient(next)
+		next = stripFileURIScheme(next)
+		if strings.ContainsRune(next, 0) {
+			return "", true
+		}
+		if next == s {
+			break
+		}
+		s = next
+	}
+	return s, false
+}
+
+func stripFileURIScheme(s string) string {
+	lower := strings.ToLower(s)
+	if !strings.HasPrefix(lower, "file://") {
+		return s
+	}
+	rest := s[7:]
+	// Drop query or fragment components from file:// URIs.
+	if idx := strings.IndexAny(rest, "?#"); idx >= 0 {
+		rest = rest[:idx]
+	}
+	// Strip optional case-insensitive "localhost" authority.
+	if len(rest) >= len("localhost") && strings.EqualFold(rest[:len("localhost")], "localhost") {
+		after := rest[len("localhost"):]
+		if after == "" || after[0] == '/' || after[0] == '\\' {
+			rest = after
+		}
+	}
+	// Normalize Windows drive URI: /C:/... -> C:/...
+	if len(rest) >= 3 && (rest[0] == '/' || rest[0] == '\\') &&
+		((rest[1] >= 'A' && rest[1] <= 'Z') || (rest[1] >= 'a' && rest[1] <= 'z')) &&
+		rest[2] == ':' {
+		rest = rest[1:]
+	}
+	return rest
+}
+
+// percentDecodeLenient decodes every valid %XX hex pair without aborting on stray '%'
+// characters, preventing evasion via trailing invalid sequences like "%2e%2e%2f%zz".
+func percentDecodeLenient(s string) string {
+	if !strings.ContainsRune(s, '%') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			hi := unhexByte(s[i+1])
+			lo := unhexByte(s[i+2])
+			if hi >= 0 && lo >= 0 {
+				b.WriteByte(byte(hi<<4 | lo))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func unhexByte(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	default:
+		return -1
+	}
+}
+
 // EvaluateDomain validates an outbound target host and port against NetworkPolicy.
 func (p *Policy) EvaluateDomain(host string, port int) Decision {
 	cleanHost := strings.ToLower(strings.TrimSpace(host))
-	cleanHost = strings.TrimSuffix(cleanHost, ".")
 	if h, _, err := net.SplitHostPort(cleanHost); err == nil {
-		cleanHost = strings.Trim(h, "[]")
-	} else {
-		cleanHost = strings.Trim(cleanHost, "[]")
+		cleanHost = h
 	}
+	cleanHost = strings.Trim(cleanHost, "[]")
+	cleanHost = strings.TrimRight(cleanHost, ".")
 
 	if !p.Network.Enabled {
 		return Decision{
@@ -592,7 +703,7 @@ func resolveExistingAncestors(p string) string {
 
 func domainMatch(pattern, host string) bool {
 	pat := strings.ToLower(strings.TrimSpace(pattern))
-	pat = strings.TrimSuffix(pat, ".")
+	pat = strings.TrimRight(pat, ".")
 	if pat == "" || host == "" {
 		return false
 	}

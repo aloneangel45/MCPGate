@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -131,8 +132,19 @@ func configurePlatformProcess(wc *WrappedCmd) error {
 	}
 
 	if err := setJobObjectLimits(jobHandle, &info); err != nil {
-		_ = syscall.CloseHandle(jobHandle)
-		return fmt.Errorf("sandbox: configure Win32 job object limits: %w", err)
+		// In restricted nested-job containers, extended memory/process limits may be rejected;
+		// retry with minimal KILL_ON_JOB_CLOSE before falling back gracefully.
+		minInfo := jobObjectExtendedLimitInfo{}
+		minInfo.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
+		if retryErr := setJobObjectLimits(jobHandle, &minInfo); retryErr != nil {
+			_ = syscall.CloseHandle(jobHandle)
+			if isNestedJobDenied(err) || isNestedJobDenied(retryErr) {
+				wc.ActiveControls = append(wc.ActiveControls, "win32_job_object_fallback")
+				return nil
+			}
+			return fmt.Errorf("sandbox: configure Win32 job object limits: %w", err)
+		}
+		controls = []string{"win32_job_object"}
 	}
 
 	wc.ActiveControls = append(wc.ActiveControls, controls...)
@@ -153,6 +165,13 @@ func configurePlatformProcess(wc *WrappedCmd) error {
 		pid := uint32(wc.Cmd.Process.Pid)
 		procHandle, err := syscall.OpenProcess(processSetQuota|processTerminate|processQueryInfo, false, pid)
 		if err != nil {
+			if isNestedJobDenied(err) {
+				closed = true
+				_ = syscall.CloseHandle(jobHandle)
+				jobHandle = 0
+				wc.ActiveControls = append(wc.ActiveControls, "win32_job_object_fallback")
+				return nil
+			}
 			return fmt.Errorf("sandbox: open child process %d for job assignment: %w", pid, err)
 		}
 		defer syscall.CloseHandle(procHandle)
@@ -160,6 +179,15 @@ func configurePlatformProcess(wc *WrappedCmd) error {
 		if err := assignProcessToJobObject(jobHandle, procHandle); err != nil {
 			// If the child exited almost instantaneously before assignment, allow clean exit.
 			if exited, _ := processHasExited(procHandle); exited {
+				return nil
+			}
+			// If running inside a restricted parent Win32 Job Object without nested-job / breakaway
+			// rights (e.g. Windows containers or CI sandboxes), degrade gracefully instead of breaking mcpgate run.
+			if isNestedJobDenied(err) {
+				closed = true
+				_ = syscall.CloseHandle(jobHandle)
+				jobHandle = 0
+				wc.ActiveControls = append(wc.ActiveControls, "win32_job_object_fallback")
 				return nil
 			}
 			return fmt.Errorf("sandbox: assign process %d to Win32 job object: %w", pid, err)
@@ -238,6 +266,10 @@ func terminateJobObject(job syscall.Handle, exitCode uint32) error {
 		return fmt.Errorf("TerminateJobObject failed")
 	}
 	return nil
+}
+
+func isNestedJobDenied(err error) bool {
+	return errors.Is(err, syscall.ERROR_ACCESS_DENIED)
 }
 
 func processHasExited(proc syscall.Handle) (bool, error) {

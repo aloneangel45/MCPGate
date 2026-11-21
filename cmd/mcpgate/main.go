@@ -11,8 +11,8 @@ import (
 )
 
 // Version is the semantic version of MCPGate, overridable via:
-// -ldflags "-X main.Version=1.0.0"
-var Version = "1.0.0"
+// -ldflags "-X main.Version=1.0.1"
+var Version = "1.0.1"
 
 // exitError signals a non-zero exit code without re-printing usage or duplicate error text.
 type exitError struct {

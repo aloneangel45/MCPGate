@@ -107,7 +107,7 @@ type Proxy struct {
 	onEvent    func(policy.SecurityEvent)
 
 	mu          sync.RWMutex
-	pending     map[string]pendingRequest
+	pending     map[string][]pendingRequest
 	quarantined map[string]QuarantineEntry
 	clientMode  frameMode
 
@@ -161,7 +161,7 @@ func NewProxy(opts Options) (*Proxy, error) {
 		}),
 		approver:    opts.Approver,
 		onEvent:     opts.OnEvent,
-		pending:     make(map[string]pendingRequest),
+		pending:     make(map[string][]pendingRequest),
 		quarantined: make(map[string]QuarantineEntry),
 	}, nil
 }
@@ -245,7 +245,6 @@ func (p *Proxy) Run(ctx context.Context, clientIn io.Reader, clientOut io.Writer
 					clientDone <- werr
 					return
 				}
-				continue
 			}
 			if forwardBytes != nil {
 				if werr := writeFrame(serverIn, &serverInMu, forwardBytes, mode); werr != nil {
@@ -343,6 +342,42 @@ type toolCallParams struct {
 }
 
 func (p *Proxy) processClientMessage(raw []byte) (forward []byte, syntheticResponse []byte) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(trimmed, &batch); err != nil {
+			// Malformed JSON array; reject safely instead of forwarding uninspected payload.
+			return nil, buildErrorResponse(json.RawMessage("null"), -32700, "MCPGate rejected malformed JSON-RPC batch", nil)
+		}
+		if len(batch) == 0 {
+			return raw, nil
+		}
+
+		var fwdItems []json.RawMessage
+		var synthItems []json.RawMessage
+		for _, item := range batch {
+			fwd, synth := p.processSingleClientMessage(item)
+			if synth != nil {
+				synthItems = append(synthItems, json.RawMessage(synth))
+			}
+			if fwd != nil {
+				fwdItems = append(fwdItems, json.RawMessage(fwd))
+			}
+		}
+
+		var outFwd, outSynth []byte
+		if len(fwdItems) > 0 {
+			outFwd, _ = json.Marshal(fwdItems)
+		}
+		if len(synthItems) > 0 {
+			outSynth, _ = json.Marshal(synthItems)
+		}
+		return outFwd, outSynth
+	}
+	return p.processSingleClientMessage(raw)
+}
+
+func (p *Proxy) processSingleClientMessage(raw []byte) (forward []byte, syntheticResponse []byte) {
 	var env rpcEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		// Pass malformed or non-object payloads through untouched.
@@ -558,6 +593,35 @@ func (p *Proxy) processClientMessage(raw []byte) (forward []byte, syntheticRespo
 }
 
 func (p *Proxy) processServerMessage(raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(trimmed, &batch); err != nil {
+			return raw
+		}
+		if len(batch) == 0 {
+			return raw
+		}
+		outItems := make([]json.RawMessage, 0, len(batch))
+		for _, item := range batch {
+			processed := p.processSingleServerMessage(item)
+			if len(processed) > 0 {
+				outItems = append(outItems, json.RawMessage(processed))
+			}
+		}
+		if len(outItems) == 0 {
+			return nil
+		}
+		out, err := json.Marshal(outItems)
+		if err != nil {
+			return raw
+		}
+		return out
+	}
+	return p.processSingleServerMessage(raw)
+}
+
+func (p *Proxy) processSingleServerMessage(raw []byte) []byte {
 	var env rpcEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return raw
@@ -757,13 +821,10 @@ func (p *Proxy) inspectToolCallResponse(raw []byte, env rpcEnvelope, toolName st
 		})
 	}
 
-	// 2. Scan tool output for leaked secrets (DLP).
-	if !p.pol.DLP.Enabled || p.scanner == nil || len(env.Result) == 0 {
-		return raw
-	}
-
-	var resultAny any
-	if err := json.Unmarshal(env.Result, &resultAny); err != nil {
+	// 2. Scan tool output (both result and error payloads) for leaked secrets (DLP).
+	hasResult := len(bytes.TrimSpace(env.Result)) > 0 && !bytes.Equal(bytes.TrimSpace(env.Result), []byte("null"))
+	hasError := len(bytes.TrimSpace(env.Error)) > 0 && !bytes.Equal(bytes.TrimSpace(env.Error), []byte("null"))
+	if !p.pol.DLP.Enabled || p.scanner == nil || (!hasResult && !hasError) {
 		return raw
 	}
 
@@ -773,12 +834,35 @@ func (p *Proxy) inspectToolCallResponse(raw []byte, env rpcEnvelope, toolName st
 	}
 
 	var findings []DLPFinding
-	var redactedVal any
-	var modified bool
-	if action == policy.ActionRedact {
-		redactedVal, findings, modified = redactAny(resultAny, p.scanner)
-	} else {
-		scanAny(resultAny, p.scanner, &findings)
+	var redactedResult any
+	var resultModified bool
+	var redactedError any
+	var errorModified bool
+
+	if hasResult {
+		var resultAny any
+		if err := json.Unmarshal(env.Result, &resultAny); err == nil {
+			if action == policy.ActionRedact {
+				var rf []DLPFinding
+				redactedResult, rf, resultModified = redactAny(resultAny, p.scanner)
+				findings = append(findings, rf...)
+			} else {
+				scanAny(resultAny, p.scanner, &findings)
+			}
+		}
+	}
+
+	if hasError {
+		var errorAny any
+		if err := json.Unmarshal(env.Error, &errorAny); err == nil {
+			if action == policy.ActionRedact {
+				var ef []DLPFinding
+				redactedError, ef, errorModified = redactAny(errorAny, p.scanner)
+				findings = append(findings, ef...)
+			} else {
+				scanAny(errorAny, p.scanner, &findings)
+			}
+		}
 	}
 
 	if len(findings) == 0 {
@@ -815,11 +899,25 @@ func (p *Proxy) inspectToolCallResponse(raw []byte, env rpcEnvelope, toolName st
 			Tool:     toolName,
 			Message:  msg,
 		})
-		if modified {
+		if resultModified || errorModified {
 			var fullMsg map[string]json.RawMessage
 			if err := json.Unmarshal(raw, &fullMsg); err == nil {
-				if newRes, err := json.Marshal(redactedVal); err == nil {
-					fullMsg["result"] = newRes
+				ok := true
+				if resultModified {
+					if newRes, err := json.Marshal(redactedResult); err == nil {
+						fullMsg["result"] = newRes
+					} else {
+						ok = false
+					}
+				}
+				if errorModified {
+					if newErr, err := json.Marshal(redactedError); err == nil {
+						fullMsg["error"] = newErr
+					} else {
+						ok = false
+					}
+				}
+				if ok {
 					if out, err := json.Marshal(fullMsg); err == nil {
 						return out
 					}
@@ -862,18 +960,24 @@ func (p *Proxy) getQuarantined(toolName string) (QuarantineEntry, bool) {
 
 func (p *Proxy) recordPending(idKey string, req pendingRequest) {
 	p.mu.Lock()
-	p.pending[idKey] = req
+	p.pending[idKey] = append(p.pending[idKey], req)
 	p.mu.Unlock()
 }
 
 func (p *Proxy) popPending(idKey string) (pendingRequest, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	req, ok := p.pending[idKey]
-	if ok {
-		delete(p.pending, idKey)
+	queue := p.pending[idKey]
+	if len(queue) == 0 {
+		return pendingRequest{}, false
 	}
-	return req, ok
+	req := queue[0]
+	if len(queue) == 1 {
+		delete(p.pending, idKey)
+	} else {
+		p.pending[idKey] = queue[1:]
+	}
+	return req, true
 }
 
 func (p *Proxy) emit(ev policy.SecurityEvent) {
@@ -894,8 +998,25 @@ func (p *Proxy) emit(ev policy.SecurityEvent) {
 
 func canonicalIDKey(raw json.RawMessage) string {
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if len(trimmed) == 0 {
 		return ""
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return "null"
+	}
+	// Canonicalize JSON string/number IDs so equivalent encodings (e.g. "a\u0062" vs "ab") match.
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err == nil {
+		switch val := v.(type) {
+		case string:
+			if b, err := json.Marshal(val); err == nil {
+				return string(b)
+			}
+		case json.Number:
+			return val.String()
+		}
 	}
 	return string(trimmed)
 }
@@ -1026,10 +1147,22 @@ func normalizeCandidatePath(parentKey, raw string) (string, bool) {
 
 	lower := strings.ToLower(s)
 
-	// Handle file:// URIs explicitly; ignore non-file URLs (http://, https://, etc.).
+	// Handle file:// URIs explicitly (case-insensitive localhost, query/fragment, Windows /C:/...);
+	// ignore non-file URLs (http://, https://, etc.).
 	if strings.HasPrefix(lower, "file://") {
-		p := strings.TrimPrefix(s[7:], "localhost")
-		if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+		p := s[7:]
+		if idx := strings.IndexAny(p, "?#"); idx >= 0 {
+			p = p[:idx]
+		}
+		if len(p) >= len("localhost") && strings.EqualFold(p[:len("localhost")], "localhost") {
+			after := p[len("localhost"):]
+			if after == "" || after[0] == '/' || after[0] == '\\' {
+				p = after
+			}
+		}
+		if len(p) >= 3 && (p[0] == '/' || p[0] == '\\') &&
+			((p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z')) &&
+			p[2] == ':' {
 			// Windows file:///C:/... -> C:/...
 			p = p[1:]
 		}
@@ -1046,7 +1179,53 @@ func normalizeCandidatePath(parentKey, raw string) (string, bool) {
 	if looksLikeFilesystemPath(s) {
 		return s, true
 	}
+	if decoded := decodePercentForPathCheck(s); decoded != s && looksLikeFilesystemPath(decoded) {
+		return s, true
+	}
 	return "", false
+}
+
+func decodePercentForPathCheck(s string) string {
+	if !strings.ContainsRune(s, '%') {
+		return s
+	}
+	cur := s
+	for pass := 0; pass < 3; pass++ {
+		var b strings.Builder
+		b.Grow(len(cur))
+		changed := false
+		for i := 0; i < len(cur); i++ {
+			if cur[i] == '%' && i+2 < len(cur) {
+				hi := hexVal(cur[i+1])
+				lo := hexVal(cur[i+2])
+				if hi >= 0 && lo >= 0 {
+					b.WriteByte(byte(hi<<4 | lo))
+					i += 2
+					changed = true
+					continue
+				}
+			}
+			b.WriteByte(cur[i])
+		}
+		if !changed {
+			break
+		}
+		cur = b.String()
+	}
+	return cur
+}
+
+func hexVal(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	default:
+		return -1
+	}
 }
 
 func looksLikeFilesystemPath(s string) bool {
@@ -1093,6 +1272,22 @@ func scanAny(v any, scanner PayloadScanner, findings *[]DLPFinding) {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			if k != "" {
+				*findings = append(*findings, scanner.ScanPayload(k)...)
+			}
+			if s, ok := val[k].(string); ok {
+				if s != "" {
+					sf := scanner.ScanPayload(s)
+					if len(sf) > 0 {
+						*findings = append(*findings, sf...)
+					} else if k != "" {
+						// Also inspect key=value pair so contextual rules (e.g. aws_secret_access_key)
+						// trigger on structured JSON objects like structuredContent or tool arguments.
+						*findings = append(*findings, scanner.ScanPayload(k+"="+s)...)
+					}
+				}
+				continue
+			}
 			scanAny(val[k], scanner, findings)
 		}
 	case []any:
@@ -1120,8 +1315,43 @@ func redactAny(v any, scanner PayloadScanner) (any, []DLPFinding, bool) {
 		var all []DLPFinding
 		changed := false
 		for _, k := range keys {
+			outKey := k
+			if k != "" {
+				if rk, kf := scanner.RedactPayload(k); len(kf) > 0 {
+					all = append(all, kf...)
+					if rk != k {
+						outKey = rk
+						changed = true
+					}
+				}
+			}
+			if s, ok := val[k].(string); ok {
+				if s == "" {
+					out[outKey] = s
+					continue
+				}
+				rs, sf := scanner.RedactPayload(s)
+				if len(sf) > 0 {
+					out[outKey] = rs
+					all = append(all, sf...)
+					if rs != s {
+						changed = true
+					}
+					continue
+				}
+				if k != "" {
+					if cf := scanner.ScanPayload(k + "=" + s); len(cf) > 0 {
+						out[outKey] = "[MCPGATE-REDACTED:" + cf[0].RuleID + "]"
+						all = append(all, cf...)
+						changed = true
+						continue
+					}
+				}
+				out[outKey] = s
+				continue
+			}
 			nv, f, c := redactAny(val[k], scanner)
-			out[k] = nv
+			out[outKey] = nv
 			all = append(all, f...)
 			if c {
 				changed = true
@@ -1181,6 +1411,11 @@ func maxPoisonSeverity(findings []PoisonFinding) policy.Severity {
 	return best
 }
 
+const (
+	maxHeaderLines = 64
+	maxHeaderBytes = 8192
+)
+
 // readFrame auto-detects and reads a single JSON-RPC message framed either as
 // NDJSON (newline-delimited) or LSP-style Content-Length headers.
 func readFrame(br *bufio.Reader) ([]byte, frameMode, error) {
@@ -1189,6 +1424,13 @@ func readFrame(br *bufio.Reader) ([]byte, frameMode, error) {
 		if err != nil {
 			return nil, frameUnknown, err
 		}
+		// Strip optional leading UTF-8 BOM (0xEF 0xBB 0xBF).
+		if b[0] == 0xEF {
+			if bom, bomErr := br.Peek(3); bomErr == nil && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+				_, _ = br.Discard(3)
+				continue
+			}
+		}
 		if b[0] == '\r' || b[0] == '\n' || b[0] == ' ' || b[0] == '\t' {
 			_, _ = br.ReadByte()
 			continue
@@ -1196,7 +1438,7 @@ func readFrame(br *bufio.Reader) ([]byte, frameMode, error) {
 
 		// NDJSON frame (starts directly with JSON object or array).
 		if b[0] == '{' || b[0] == '[' {
-			line, err := br.ReadBytes('\n')
+			line, err := readBoundedLine(br, maxFrameBytes)
 			if err != nil && !errors.Is(err, io.EOF) {
 				return nil, frameUnknown, err
 			}
@@ -1210,27 +1452,37 @@ func readFrame(br *bufio.Reader) ([]byte, frameMode, error) {
 			return trimmed, frameNDJSON, nil
 		}
 
-		// Content-Length header framing.
+		// Content-Length header framing (supports arbitrary non-canonical MIME headers before Content-Length).
 		contentLength := -1
+		headerCount := 0
 		for {
-			line, err := br.ReadString('\n')
+			lineBytes, err := readBoundedLine(br, maxHeaderBytes)
 			if err != nil {
 				return nil, frameUnknown, err
 			}
-			trimmed := strings.TrimRight(line, "\r\n")
+			trimmed := strings.TrimRight(string(lineBytes), "\r\n")
 			if trimmed == "" {
 				break
 			}
-			if idx := strings.IndexByte(trimmed, ':'); idx > 0 {
-				key := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
-				val := strings.TrimSpace(trimmed[idx+1:])
-				if key == "content-length" {
-					n, convErr := strconv.Atoi(val)
-					if convErr != nil || n < 0 || n > maxFrameBytes {
-						return nil, frameUnknown, fmt.Errorf("invalid Content-Length header %q", val)
-					}
-					contentLength = n
+			headerCount++
+			if headerCount > maxHeaderLines {
+				return nil, frameUnknown, fmt.Errorf("too many MIME headers in framed JSON-RPC message")
+			}
+			idx := strings.IndexByte(trimmed, ':')
+			if idx <= 0 {
+				return nil, frameUnknown, fmt.Errorf("malformed header line %q in framed JSON-RPC message", trimmed)
+			}
+			key := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+			val := strings.TrimSpace(trimmed[idx+1:])
+			if key == "content-length" {
+				n, convErr := strconv.Atoi(val)
+				if convErr != nil || n < 0 || n > maxFrameBytes {
+					return nil, frameUnknown, fmt.Errorf("invalid Content-Length header %q", val)
 				}
+				if contentLength >= 0 && contentLength != n {
+					return nil, frameUnknown, fmt.Errorf("conflicting duplicate Content-Length headers (%d vs %d)", contentLength, n)
+				}
+				contentLength = n
 			}
 		}
 
@@ -1242,6 +1494,25 @@ func readFrame(br *bufio.Reader) ([]byte, frameMode, error) {
 			return nil, frameUnknown, err
 		}
 		return buf, frameContentLength, nil
+	}
+}
+
+func readBoundedLine(br *bufio.Reader, maxLen int) ([]byte, error) {
+	var out []byte
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		if len(frag) > 0 {
+			if len(out)+len(frag) > maxLen {
+				return nil, fmt.Errorf("JSON-RPC frame line exceeds %d byte limit", maxLen)
+			}
+			out = append(out, frag...)
+		}
+		if err != nil {
+			return out, err
+		}
+		if !isPrefix {
+			return out, nil
+		}
 	}
 }
 

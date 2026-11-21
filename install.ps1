@@ -22,7 +22,7 @@ $Repo = if ($env:MCPGATE_REPO) { $env:MCPGATE_REPO } else { 'aloneangel45/MCPGat
 $Version = if ($env:MCPGATE_VERSION) { $env:MCPGATE_VERSION } else { 'latest' }
 $BaseUrl = if ($env:MCPGATE_BASE_URL) { $env:MCPGATE_BASE_URL } else { "https://github.com/$Repo/releases" }
 $ApiUrl = if ($env:MCPGATE_API_URL) { $env:MCPGATE_API_URL } else { "https://api.github.com/repos/$Repo/releases/latest" }
-$FallbackVersion = 'v1.0.0'
+$FallbackVersion = 'v1.0.1'
 
 $ArchRaw = if ($env:MCPGATE_ARCH_OVERRIDE) {
     $env:MCPGATE_ARCH_OVERRIDE

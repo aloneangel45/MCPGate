@@ -103,14 +103,33 @@ func buildCleanEnvForOS(cfg policy.SandboxPolicy, baseEnv []string, extra map[st
 		}
 	}
 
-	for k, v := range extra {
+	// Sort extra keys deterministically; on case-insensitive platforms (Windows),
+	// process lowercase keys before uppercase so canonical uppercase keys (e.g. HTTP_PROXY
+	// over http_proxy) deterministically win deduplication.
+	extraKeys := make([]string, 0, len(extra))
+	for k := range extra {
+		extraKeys = append(extraKeys, k)
+	}
+	sort.Slice(extraKeys, func(i, j int) bool {
+		if caseInsensitive {
+			ui, uj := strings.ToUpper(extraKeys[i]), strings.ToUpper(extraKeys[j])
+			if ui == uj {
+				// Lowercase sorts before uppercase so uppercase overwrites last.
+				return extraKeys[i] > extraKeys[j]
+			}
+			return ui < uj
+		}
+		return extraKeys[i] < extraKeys[j]
+	})
+
+	for _, k := range extraKeys {
 		trimmed := strings.TrimSpace(k)
 		if trimmed == "" {
 			continue
 		}
 		nk := normKey(trimmed)
 		origKey[nk] = trimmed
-		result[nk] = v
+		result[nk] = extra[k]
 	}
 
 	out := make([]string, 0, len(result))
@@ -264,16 +283,38 @@ func GenerateSeatbeltProfile(workDir string, restrictWrites bool) string {
 	b.WriteString(")\n")
 
 	if restrictWrites && strings.TrimSpace(workDir) != "" {
-		absDir, err := filepath.Abs(workDir)
-		if err != nil {
-			absDir = workDir
-		}
-		escaped := strings.ReplaceAll(absDir, `\`, `\\`)
-		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 		b.WriteString("(deny file-write*)\n")
-		b.WriteString(fmt.Sprintf("(allow file-write* (subpath \"%s\"))\n", escaped))
+		// Fail closed if workDir contains raw control characters (NUL/CR/LF) that could break SBPL grammar.
+		if !strings.ContainsAny(workDir, "\x00\r\n") {
+			absDir, err := filepath.Abs(workDir)
+			if err != nil {
+				absDir = workDir
+			}
+			if !strings.ContainsAny(absDir, "\x00\r\n") {
+				escaped := escapeSBPLString(absDir)
+				b.WriteString(fmt.Sprintf("(allow file-write* (subpath \"%s\"))\n", escaped))
+			}
+		}
 		b.WriteString("(allow file-write* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (literal \"/dev/null\"))\n")
 	}
 
+	return b.String()
+}
+
+func escapeSBPLString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteByte(s[i])
+		}
+	}
 	return b.String()
 }

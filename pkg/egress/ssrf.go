@@ -50,11 +50,24 @@ var (
 		{netip.MustParsePrefix("192.168.0.0/16"), "RFC1918 private"},
 		{netip.MustParsePrefix("169.254.0.0/16"), "IPv4 link-local"},
 		{netip.MustParsePrefix("100.64.0.0/10"), "CGNAT shared address space"},
+		{netip.MustParsePrefix("192.0.0.0/24"), "IETF protocol assignments"},
+		{netip.MustParsePrefix("198.18.0.0/15"), "benchmarking reserved"},
+		{netip.MustParsePrefix("240.0.0.0/4"), "IPv4 reserved"},
+		{netip.MustParsePrefix("255.255.255.255/32"), "IPv4 limited broadcast"},
 		{netip.MustParsePrefix("::/128"), "IPv6 unspecified"},
 		{netip.MustParsePrefix("::1/128"), "IPv6 loopback"},
 		{netip.MustParsePrefix("fe80::/10"), "IPv6 link-local"},
 		{netip.MustParsePrefix("fc00::/7"), "IPv6 unique local (ULA)"},
+		{netip.MustParsePrefix("100::/64"), "IPv6 discard-only"},
+		{netip.MustParsePrefix("2001:db8::/32"), "IPv6 documentation"},
+		{netip.MustParsePrefix("64:ff9b::/96"), "IPv6 NAT64 well-known"},
+		{netip.MustParsePrefix("64:ff9b:1::/48"), "IPv6 NAT64 local-use"},
 	}
+
+	nat64WellKnownPrefix  = netip.MustParsePrefix("64:ff9b::/96")
+	ipv4TranslatedPrefix  = netip.MustParsePrefix("::ffff:0:0:0/96")
+	ipv4CompatiblePrefix  = netip.MustParsePrefix("::/96")
+	sixToFourPrefix       = netip.MustParsePrefix("2002::/16")
 )
 
 // ValidateTargetHost checks whether a hostname directly targets a cloud metadata endpoint.
@@ -91,7 +104,20 @@ func ValidateTargetIP(ip net.IP, cfg policy.NetworkPolicy) (blocked bool, ruleID
 	if !ok {
 		return true, "MCP04-SSRF-PRIVATE-IP", fmt.Sprintf("invalid IP address %q", ip.String())
 	}
-	addr = addr.Unmap()
+	return validateTargetAddr(addr.Unmap(), cfg)
+}
+
+func validateTargetAddr(addr netip.Addr, cfg policy.NetworkPolicy) (blocked bool, ruleID string, reason string) {
+	addr = addr.Unmap().WithZone("")
+
+	// Unwrap IPv6 transition/embedded IPv4 representations (NAT64 64:ff9b::/96,
+	// IPv4-translated ::ffff:0:0:0/96, IPv4-compatible ::/96, 6to4 2002::/16) so
+	// they cannot bypass cloud metadata or private IPv4 SSRF controls.
+	if embedded, ok := extractEmbeddedIPv4(addr); ok {
+		if b, r, msg := validateTargetAddr(embedded, cfg); b {
+			return true, r, fmt.Sprintf("%s (embedded in %s)", msg, addr.String())
+		}
+	}
 
 	// 1. Cloud metadata endpoints (checked first so metadata IPs get MCP04-SSRF-METADATA).
 	if cfg.BlockCloudMetadata {
@@ -115,6 +141,23 @@ func ValidateTargetIP(ip net.IP, cfg policy.NetworkPolicy) (blocked bool, ruleID
 	}
 
 	return false, "", ""
+}
+
+func extractEmbeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
+	if !addr.Is6() {
+		return netip.Addr{}, false
+	}
+	b := addr.As16()
+	switch {
+	case nat64WellKnownPrefix.Contains(addr), ipv4TranslatedPrefix.Contains(addr):
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	case ipv4CompatiblePrefix.Contains(addr) && !addr.IsUnspecified() && !addr.IsLoopback():
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	case sixToFourPrefix.Contains(addr):
+		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
+	default:
+		return netip.Addr{}, false
+	}
 }
 
 // resolveAndPinIP resolves host via DNS before dialing, validates EVERY returned IP against
@@ -151,8 +194,8 @@ func resolveAndPinIP(ctx context.Context, resolver *net.Resolver, host string, c
 		return nil
 	}
 
-	// Direct IP literal target.
-	if literal := net.ParseIP(clean); literal != nil {
+	// Direct IP literal target (supports IPv4, IPv6, IPv4-mapped IPv6, and IPv6 zone IDs).
+	if literal := parseIPLiteral(clean); literal != nil {
 		if blockErr := checkIP(literal); blockErr != nil {
 			return nil, blockErr, nil
 		}
@@ -194,13 +237,29 @@ func resolveAndPinIP(ctx context.Context, resolver *net.Resolver, host string, c
 	return preferred, nil, nil
 }
 
+func parseIPLiteral(host string) net.IP {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip
+	}
+	// Handle RFC 6874 IPv6 zone identifiers (e.g. fe80::1%eth0 or fe80::1%25eth0).
+	candidate := host
+	if idx := strings.Index(candidate, "%25"); idx >= 0 {
+		candidate = candidate[:idx] + "%" + candidate[idx+3:]
+	}
+	if addr, err := netip.ParseAddr(candidate); err == nil {
+		unmapped := addr.Unmap().WithZone("")
+		return net.IP(unmapped.AsSlice())
+	}
+	return nil
+}
+
 func normalizeHost(host string) string {
 	clean := strings.ToLower(strings.TrimSpace(host))
 	if h, _, err := net.SplitHostPort(clean); err == nil {
 		clean = h
 	}
 	clean = strings.Trim(clean, "[]")
-	clean = strings.TrimSuffix(clean, ".")
+	clean = strings.TrimRight(clean, ".")
 	return clean
 }
 

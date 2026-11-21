@@ -59,18 +59,9 @@ func serveSelfMCP(in io.Reader, out io.Writer) error {
 			return err
 		}
 
-		var req selfRPCRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			resp := buildSelfError(json.RawMessage("null"), -32700, "Parse error: "+err.Error())
-			if werr := writeJSONRPCFrame(out, resp, mode); werr != nil {
-				return werr
-			}
-			continue
-		}
-
-		resp := handleSelfMCPRequest(req)
+		resp := processSelfMCPPayload(raw)
 		if resp == nil {
-			// Notification (no response expected).
+			// Notification(s) only (no response expected).
 			continue
 		}
 		if err := writeJSONRPCFrame(out, resp, mode); err != nil {
@@ -79,8 +70,64 @@ func serveSelfMCP(in io.Reader, out io.Writer) error {
 	}
 }
 
+func processSelfMCPPayload(raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return buildSelfError(json.RawMessage("null"), -32600, "Invalid Request: empty payload")
+	}
+
+	if trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(trimmed, &batch); err != nil {
+			return buildSelfError(json.RawMessage("null"), -32700, "Parse error: "+err.Error())
+		}
+		if len(batch) == 0 {
+			return buildSelfError(json.RawMessage("null"), -32600, "Invalid Request: empty batch")
+		}
+		responses := make([]json.RawMessage, 0, len(batch))
+		for _, item := range batch {
+			var req selfRPCRequest
+			if err := json.Unmarshal(item, &req); err != nil {
+				responses = append(responses, json.RawMessage(buildSelfError(json.RawMessage("null"), -32600, "Invalid Request: "+err.Error())))
+				continue
+			}
+			if r := handleSelfMCPRequest(req); r != nil {
+				responses = append(responses, json.RawMessage(r))
+			}
+		}
+		if len(responses) == 0 {
+			return nil
+		}
+		b, _ := json.Marshal(responses)
+		return b
+	}
+
+	if trimmed[0] != '{' {
+		return buildSelfError(json.RawMessage("null"), -32600, "Invalid Request: expected JSON object or batch array")
+	}
+
+	var req selfRPCRequest
+	if err := json.Unmarshal(trimmed, &req); err != nil {
+		return buildSelfError(json.RawMessage("null"), -32700, "Parse error: "+err.Error())
+	}
+	return handleSelfMCPRequest(req)
+}
+
 func handleSelfMCPRequest(req selfRPCRequest) []byte {
 	hasID := len(bytes.TrimSpace(req.ID)) > 0
+
+	if req.JSONRPC != "" && req.JSONRPC != "2.0" {
+		if !hasID {
+			return nil
+		}
+		return buildSelfError(req.ID, -32600, fmt.Sprintf("Invalid Request: unsupported jsonrpc version %q", req.JSONRPC))
+	}
+	if strings.TrimSpace(req.Method) == "" {
+		if !hasID {
+			return nil
+		}
+		return buildSelfError(req.ID, -32600, "Invalid Request: missing method")
+	}
 
 	switch req.Method {
 	case "initialize":
@@ -119,7 +166,11 @@ func handleSelfMCPRequest(req selfRPCRequest) []byte {
 				return buildSelfError(req.ID, -32602, "Invalid params: "+err.Error())
 			}
 		}
-		resPayload, isErr, rpcErr := dispatchSelfMCPTool(strings.TrimSpace(params.Name), params.Arguments)
+		toolName := strings.TrimSpace(params.Name)
+		if toolName == "" {
+			return buildSelfError(req.ID, -32602, "Invalid params: missing tool name")
+		}
+		resPayload, isErr, rpcErr := dispatchSelfMCPTool(toolName, params.Arguments)
 		if rpcErr != nil {
 			return buildSelfError(req.ID, rpcErr.code, rpcErr.msg)
 		}
@@ -420,6 +471,11 @@ func buildSelfError(id json.RawMessage, code int, msg string) []byte {
 	return b
 }
 
+const (
+	maxSelfHeaderLines = 64
+	maxSelfHeaderBytes = 8192
+)
+
 // readJSONRPCFrame reads a single NDJSON or LSP Content-Length framed JSON-RPC message.
 func readJSONRPCFrame(br *bufio.Reader) ([]byte, rpcFrameMode, error) {
 	for {
@@ -427,13 +483,20 @@ func readJSONRPCFrame(br *bufio.Reader) ([]byte, rpcFrameMode, error) {
 		if err != nil {
 			return nil, rpcFrameUnknown, err
 		}
+		// Strip optional leading UTF-8 BOM.
+		if b[0] == 0xEF {
+			if bom, bomErr := br.Peek(3); bomErr == nil && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+				_, _ = br.Discard(3)
+				continue
+			}
+		}
 		if b[0] == '\r' || b[0] == '\n' || b[0] == ' ' || b[0] == '\t' {
 			_, _ = br.ReadByte()
 			continue
 		}
 
 		if b[0] == '{' || b[0] == '[' {
-			line, err := br.ReadBytes('\n')
+			line, err := readSelfBoundedLine(br, maxSelfFrameBytes)
 			if err != nil && !errors.Is(err, io.EOF) {
 				return nil, rpcFrameUnknown, err
 			}
@@ -448,25 +511,35 @@ func readJSONRPCFrame(br *bufio.Reader) ([]byte, rpcFrameMode, error) {
 		}
 
 		contentLength := -1
+		headerCount := 0
 		for {
-			line, err := br.ReadString('\n')
+			lineBytes, err := readSelfBoundedLine(br, maxSelfHeaderBytes)
 			if err != nil {
 				return nil, rpcFrameUnknown, err
 			}
-			trimmed := strings.TrimRight(line, "\r\n")
+			trimmed := strings.TrimRight(string(lineBytes), "\r\n")
 			if trimmed == "" {
 				break
 			}
-			if idx := strings.IndexByte(trimmed, ':'); idx > 0 {
-				k := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
-				v := strings.TrimSpace(trimmed[idx+1:])
-				if k == "content-length" {
-					n, convErr := strconv.Atoi(v)
-					if convErr != nil || n < 0 || n > maxSelfFrameBytes {
-						return nil, rpcFrameUnknown, fmt.Errorf("invalid Content-Length header %q", v)
-					}
-					contentLength = n
+			headerCount++
+			if headerCount > maxSelfHeaderLines {
+				return nil, rpcFrameUnknown, fmt.Errorf("too many MIME headers in framed JSON-RPC message")
+			}
+			idx := strings.IndexByte(trimmed, ':')
+			if idx <= 0 {
+				return nil, rpcFrameUnknown, fmt.Errorf("malformed header line %q", trimmed)
+			}
+			k := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+			v := strings.TrimSpace(trimmed[idx+1:])
+			if k == "content-length" {
+				n, convErr := strconv.Atoi(v)
+				if convErr != nil || n < 0 || n > maxSelfFrameBytes {
+					return nil, rpcFrameUnknown, fmt.Errorf("invalid Content-Length header %q", v)
 				}
+				if contentLength >= 0 && contentLength != n {
+					return nil, rpcFrameUnknown, fmt.Errorf("conflicting duplicate Content-Length headers (%d vs %d)", contentLength, n)
+				}
+				contentLength = n
 			}
 		}
 		if contentLength < 0 {
@@ -477,6 +550,25 @@ func readJSONRPCFrame(br *bufio.Reader) ([]byte, rpcFrameMode, error) {
 			return nil, rpcFrameUnknown, err
 		}
 		return buf, rpcFrameContentLength, nil
+	}
+}
+
+func readSelfBoundedLine(br *bufio.Reader, maxLen int) ([]byte, error) {
+	var out []byte
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		if len(frag) > 0 {
+			if len(out)+len(frag) > maxLen {
+				return nil, fmt.Errorf("JSON-RPC frame line exceeds %d byte limit", maxLen)
+			}
+			out = append(out, frag...)
+		}
+		if err != nil {
+			return out, err
+		}
+		if !isPrefix {
+			return out, nil
+		}
 	}
 }
 

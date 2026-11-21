@@ -209,6 +209,9 @@ func (ca *EphemeralCA) SignHost(host string) (*tls.Certificate, error) {
 		ca.mu.Unlock()
 		return existing, nil
 	}
+	if len(ca.cache) >= 1024 {
+		ca.cache = make(map[string]*tls.Certificate)
+	}
 	ca.cache[clean] = tlsCert
 	ca.mu.Unlock()
 

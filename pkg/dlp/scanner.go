@@ -349,44 +349,59 @@ func tryDecodeBase64(token string) (string, bool) {
 	return "", false
 }
 
-// resolveOverlaps picks non-overlapping spans, preferring higher priority and longer spans,
-// then sorts final findings by Offset ascending.
+// resolveOverlaps merges overlapping spans into disjoint intervals sorted by Offset ascending.
+// When multiple rules overlap (including partial overlaps), the merged union span is covered
+// completely so Redact never leaks unredacted secret tails, while retaining the highest-priority
+// finding's metadata.
 func resolveOverlaps(in []rankedFinding) []Finding {
 	if len(in) == 0 {
 		return nil
 	}
 
 	sort.SliceStable(in, func(i, j int) bool {
+		if in[i].finding.Offset != in[j].finding.Offset {
+			return in[i].finding.Offset < in[j].finding.Offset
+		}
 		if in[i].priority != in[j].priority {
 			return in[i].priority > in[j].priority
 		}
-		if in[i].finding.Length != in[j].finding.Length {
-			return in[i].finding.Length > in[j].finding.Length
-		}
-		return in[i].finding.Offset < in[j].finding.Offset
+		return in[i].finding.Length > in[j].finding.Length
 	})
 
 	selected := make([]Finding, 0, len(in))
-	for _, cand := range in {
-		cStart := cand.finding.Offset
-		cEnd := cStart + cand.finding.Length
-		overlaps := false
-		for _, kept := range selected {
-			kStart := kept.Offset
-			kEnd := kStart + kept.Length
-			if cStart < kEnd && kStart < cEnd {
-				overlaps = true
-				break
-			}
-		}
-		if !overlaps {
-			selected = append(selected, cand.finding)
-		}
-	}
+	cur := in[0]
+	curOrigLen := cur.finding.Length
 
-	sort.Slice(selected, func(i, j int) bool {
-		return selected[i].Offset < selected[j].Offset
-	})
+	for i := 1; i < len(in); i++ {
+		cand := in[i]
+		curStart := cur.finding.Offset
+		curEnd := curStart + cur.finding.Length
+		candStart := cand.finding.Offset
+		candEnd := candStart + cand.finding.Length
+
+		if candStart < curEnd {
+			mergedEnd := curEnd
+			if candEnd > mergedEnd {
+				mergedEnd = candEnd
+			}
+			if cand.priority > cur.priority || (cand.priority == cur.priority && cand.finding.Length > curOrigLen) {
+				cur.priority = cand.priority
+				curOrigLen = cand.finding.Length
+				cur.finding.RuleID = cand.finding.RuleID
+				cur.finding.Name = cand.finding.Name
+				cur.finding.Severity = cand.finding.Severity
+				cur.finding.MatchPreview = cand.finding.MatchPreview
+				cur.finding.SHA256Prefix = cand.finding.SHA256Prefix
+			}
+			cur.finding.Length = mergedEnd - curStart
+			continue
+		}
+
+		selected = append(selected, cur.finding)
+		cur = cand
+		curOrigLen = cand.finding.Length
+	}
+	selected = append(selected, cur.finding)
 	return selected
 }
 
@@ -427,7 +442,7 @@ func builtinRules() []regexRule {
 			ruleID:      "MCP03-AWS-SECRET-KEY",
 			name:        "AWS Secret Access Key",
 			severity:    policy.SeverityCritical,
-			re:          regexp.MustCompile(`(?i)(?:aws_secret_access_key|aws_secret_key|aws[-_ ]?secret(?:[-_ ]?access)?[-_ ]?key)\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})["']?`),
+			re:          regexp.MustCompile(`(?i)(?:aws_secret_access_key|aws_secret_key|aws[-_ ]?secret(?:[-_ ]?access)?[-_ ]?key)["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})["']?`),
 			secretGroup: 1,
 			priority:    80,
 		},

@@ -92,12 +92,13 @@ func parseDotEnvFile(filePath string) ([]dotEnvSecret, error) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := strings.TrimPrefix(scanner.Text(), "\uFEFF")
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		if strings.HasPrefix(line, "export ") || strings.HasPrefix(line, "export\t") {
+			line = strings.TrimSpace(line[len("export"):])
 		}
 		eqIdx := strings.IndexByte(line, '=')
 		if eqIdx <= 0 {
@@ -163,13 +164,20 @@ func unquoteDotEnvValue(raw string) string {
 			}
 			return strings.Trim(raw, `'`)
 		}
+		if raw[0] == '`' {
+			if end := strings.IndexByte(raw[1:], '`'); end >= 0 {
+				return raw[1 : end+1]
+			}
+			return strings.Trim(raw, "`")
+		}
 	}
 
-	// Unquoted value: strip trailing inline comment preceded by whitespace.
-	if idx := strings.Index(raw, " #"); idx >= 0 {
-		raw = raw[:idx]
-	} else if idx := strings.Index(raw, "\t#"); idx >= 0 {
-		raw = raw[:idx]
+	// Unquoted value: strip the earliest inline comment preceded by space or tab.
+	for i := 1; i < len(raw); i++ {
+		if raw[i] == '#' && (raw[i-1] == ' ' || raw[i-1] == '\t') {
+			raw = raw[:i]
+			break
+		}
 	}
 	return strings.TrimSpace(raw)
 }

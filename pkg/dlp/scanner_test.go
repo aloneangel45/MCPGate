@@ -266,3 +266,102 @@ func TestDisabledScannerAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestDotEnvEdgeCasesExportQuotesCommentsAndBOM(t *testing.T) {
+	dir := t.TempDir()
+	content := "\uFEFF" + strings.Join([]string{
+		`export	TAB_EXPORT_SECRET="tab_export_secret_value_112233"`,
+		`export SINGLE_QUOTED='single_secret_val_445566' # inline comment`,
+		"UNQUOTED_TAB_HASH=unquoted_real_secret_778899\t# first comment # second hash",
+		"BACKTICK_VAL=`backtick_secret_val_990011`",
+	}, "\n") + "\n"
+
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner, err := NewScanner(policy.DLPPolicy{
+		Enabled:    true,
+		Action:     policy.ActionBlock,
+		LoadDotEnv: true,
+	}, dir)
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if got := scanner.DotEnvCount(); got != 4 {
+		t.Fatalf("DotEnvCount() = %d, want 4", got)
+	}
+
+	for _, sec := range []string{
+		"tab_export_secret_value_112233",
+		"single_secret_val_445566",
+		"unquoted_real_secret_778899",
+		"backtick_secret_val_990011",
+	} {
+		findings := scanner.Scan("exfil=" + sec)
+		if len(findings) != 1 || findings[0].RuleID != "MCP03-DOTENV-LEAK" {
+			t.Fatalf("failed to detect .env secret %q: %+v", sec, findings)
+		}
+	}
+}
+
+func TestRedactOverlappingSpansAndJSONAWSSecret(t *testing.T) {
+	// 1. Overlapping custom patterns must merge spans so no partial secret tail leaks!
+	scanner, err := NewScanner(policy.DLPPolicy{
+		Enabled: true,
+		Action:  policy.ActionRedact,
+		CustomPatterns: []policy.CustomDLPPattern{
+			{ID: "PAT-A", Name: "Left Span", Pattern: `SECRET_LEFT_MID`, Severity: policy.SeverityHigh},
+			{ID: "PAT-B", Name: "Right Span", Pattern: `MID_RIGHT_SECRET`, Severity: policy.SeverityHigh},
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+
+	input := "before SECRET_LEFT_MID_RIGHT_SECRET after"
+	redacted, findings := scanner.Redact(input)
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 merged finding, got %d: %+v", len(findings), findings)
+	}
+	if strings.Contains(redacted, "SECRET") || strings.Contains(redacted, "RIGHT") || strings.Contains(redacted, "LEFT") {
+		t.Fatalf("overlapping redaction leaked secret fragment: %q", redacted)
+	}
+	if !strings.HasPrefix(redacted, "before [MCPGATE-REDACTED:") || !strings.HasSuffix(redacted, "] after") {
+		t.Fatalf("unexpected redacted output (offset corruption?): %q", redacted)
+	}
+	if after := scanner.Scan(redacted); len(after) != 0 {
+		t.Fatalf("re-scan after overlapping redact still found matches: %+v", after)
+	}
+
+	// 2. Higher-priority .env prefix overlapping a longer OpenAI key must redact the FULL key.
+	dir := t.TempDir()
+	prefix := "sk-proj-OverlapPrefix1234"
+	fullOpenAI := prefix + "RestOfSecretKey567890ABCD"
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("PREFIX_KEY="+prefix+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	envScanner, err := NewScanner(policy.DLPPolicy{
+		Enabled:    true,
+		Action:     policy.ActionRedact,
+		LoadDotEnv: true,
+	}, dir)
+	if err != nil {
+		t.Fatalf("NewScanner env: %v", err)
+	}
+	redactedKey, _ := envScanner.Redact("auth=" + fullOpenAI + " end")
+	if strings.Contains(redactedKey, "RestOfSecretKey") || strings.Contains(redactedKey, prefix) {
+		t.Fatalf("partial overlap leaked remainder of OpenAI key: %q", redactedKey)
+	}
+
+	// 3. JSON-formatted AWS secret access key ("aws_secret_access_key": "...") must be caught & redacted.
+	awsSecret := "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	jsonPayload := `{"aws_secret_access_key": "` + awsSecret + `"}`
+	redactedJSON, jf := scanner.Redact(jsonPayload)
+	if len(jf) != 1 || jf[0].RuleID != "MCP03-AWS-SECRET-KEY" {
+		t.Fatalf("expected MCP03-AWS-SECRET-KEY on JSON payload, got %+v", jf)
+	}
+	if strings.Contains(redactedJSON, awsSecret) {
+		t.Fatalf("JSON AWS secret was not redacted: %q", redactedJSON)
+	}
+}

@@ -7,7 +7,7 @@ REPO="${MCPGATE_REPO:-aloneangel45/MCPGate}"
 VERSION="${MCPGATE_VERSION:-latest}"
 BASE_URL="${MCPGATE_BASE_URL:-https://github.com/${REPO}/releases}"
 API_URL="${MCPGATE_API_URL:-https://api.github.com/repos/${REPO}/releases/latest}"
-FALLBACK_VERSION="v1.0.0"
+FALLBACK_VERSION="v1.0.1"
 
 detect_os() {
     os="$(uname -s | tr '[:upper:]' '[:lower:]')"
