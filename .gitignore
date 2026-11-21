@@ -1,0 +1,15 @@
+# Binaries
+/mcpgate
+/mcpgate.exe
+*.exe
+*.out
+dist/
+bin/
+coverage.out
+
+# Local audit/lock scratch
+*.audit.jsonl
+.env
+.env.*
+!.env.example
+

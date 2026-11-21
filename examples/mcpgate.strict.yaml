@@ -1,0 +1,102 @@
+# MCPGate Strict Zero-Trust Policy (mcpgate/v1)
+# Recommended for untrusted third-party MCP servers, CI/CD pipelines, and production workspaces.
+version: mcpgate/v1
+name: strict-zero-trust
+preset: strict
+
+filesystem:
+  # Restrict all tool path arguments and OS sandbox access to the active project directory.
+  allow_paths:
+    - "."
+  deny_paths:
+    - "~/.ssh"
+    - "~/.aws"
+    - "~/.gnupg"
+    - "~/.kube"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/secrets/**"
+  read_only: false
+  block_sensitive_defaults: true
+
+network:
+  enabled: true
+  # Deny-by-default egress: only explicitly allowlisted HTTPS APIs are reachable.
+  allow_domains:
+    - "api.github.com"
+    - "registry.npmjs.org"
+    - "pypi.org"
+  deny_domains:
+    - "*.ngrok.io"
+    - "*.trycloudflare.com"
+    - "webhook.site"
+    - "requestbin.com"
+  allow_ports:
+    - 443
+  block_private_ips: true
+  block_cloud_metadata: true
+  inspect_tls: false
+
+dlp:
+  enabled: true
+  # Hard-block any outbound HTTP payload or MCP tool argument containing secrets/PII.
+  action: block
+  load_dotenv: true
+  dotenv_paths:
+    - ".env"
+    - ".env.local"
+  custom_patterns:
+    - id: "MCP03-CUSTOM-CORP-KEY"
+      name: "Internal Corporate API Key"
+      pattern: '\bCORP_[A-Z0-9]{24,}\b'
+      severity: critical
+
+mcp:
+  # Default-deny every tool unless explicitly allowlisted or prompted.
+  default_tool_action: deny
+  allow_tools:
+    - "read_*"
+    - "list_*"
+    - "get_*"
+    - "search_*"
+    - "inspect_*"
+  deny_tools:
+    - "*exec*"
+    - "*shell*"
+    - "*bash*"
+    - "*powershell*"
+    - "*delete_all*"
+    - "*drop_database*"
+  prompt_tools:
+    - "write_*"
+    - "edit_*"
+    - "create_*"
+  block_poisoning: true
+  quarantine_poisoned: true
+  lockfile_path: "mcpgate.lock"
+  lock_mode: enforce
+  max_calls_per_minute: 60
+  max_consecutive_errors: 6
+  max_identical_calls: 5
+
+sandbox:
+  clean_env: true
+  pass_env:
+    - "PATH"
+    - "HOME"
+    - "USER"
+    - "USERPROFILE"
+    - "TEMP"
+    - "TMP"
+    - "SYSTEMROOT"
+    - "COMSPEC"
+  work_dir: "."
+  max_memory_mb: 512
+  max_processes: 32
+  use_landlock: true
+  use_seatbelt: true
+  timeout_seconds: 300
+
+audit:
+  log_path: ".mcpgate/security-events.jsonl"
+  log_allowed: true

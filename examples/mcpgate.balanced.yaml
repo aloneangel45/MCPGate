@@ -1,0 +1,84 @@
+# MCPGate Balanced Zero-Trust Policy (mcpgate/v1)
+# Recommended for daily local IDE workflows (Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, Zed).
+version: mcpgate/v1
+name: balanced-developer
+preset: balanced
+
+filesystem:
+  # Allow workspace files while strictly blocking ~/.ssh, ~/.aws, .env, keychains, and credential stores.
+  allow_paths:
+    - "."
+  deny_paths:
+    - "~/.ssh"
+    - "~/.aws"
+    - "~/.gnupg"
+    - "~/.kube"
+  read_only: false
+  block_sensitive_defaults: true
+
+network:
+  enabled: true
+  # Block known exfiltration sinks, private RFC1918 networks, and cloud IMDS endpoints.
+  deny_domains:
+    - "*.ngrok.io"
+    - "*.interact.sh"
+    - "webhook.site"
+  allow_ports:
+    - 80
+    - 443
+  block_private_ips: true
+  block_cloud_metadata: true
+  inspect_tls: false
+
+dlp:
+  enabled: true
+  # Block secret exfiltration (AWS, GitHub, OpenAI, Anthropic, Stripe, PEM keys, .env values).
+  action: block
+  load_dotenv: true
+  dotenv_paths:
+    - ".env"
+
+mcp:
+  default_tool_action: allow
+  deny_tools:
+    - "*delete_all*"
+    - "*drop_database*"
+    - "*format_disk*"
+  prompt_tools:
+    - "*exec*"
+    - "*shell*"
+    - "*bash*"
+    - "*powershell*"
+    - "*run_command*"
+    - "*write_file*"
+    - "*delete*"
+  block_poisoning: true
+  quarantine_poisoned: true
+  lockfile_path: "mcpgate.lock"
+  lock_mode: warn
+  max_calls_per_minute: 120
+  max_consecutive_errors: 12
+  max_identical_calls: 10
+
+sandbox:
+  clean_env: true
+  pass_env:
+    - "PATH"
+    - "HOME"
+    - "USER"
+    - "USERPROFILE"
+    - "TEMP"
+    - "TMP"
+    - "SYSTEMROOT"
+    - "COMSPEC"
+    - "LANG"
+    - "LC_ALL"
+    - "TERM"
+  max_memory_mb: 1024
+  max_processes: 64
+  use_landlock: true
+  use_seatbelt: true
+
+audit:
+  log_path: ".mcpgate/security-events.jsonl"
+  log_allowed: false
